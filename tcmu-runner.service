@@ -8,6 +8,7 @@ Type=dbus
 BusName=org.kernel.TCMUService1
 KillMode=process
 ExecStart=/usr/bin/tcmu-runner
+Restart=always
 
 [Install]
 WantedBy=multi-user.target

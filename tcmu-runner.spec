@@ -15,7 +15,7 @@ BuildRequires: cmake make gcc
 BuildRequires: libnl3-devel glib2-devel zlib-devel kmod-devel
 BuildRequires: glusterfs-api-devel librados2-devel librbd1-devel
 
-Requires(pre): librados2, librbd1, kmod, zlib, libnl3, glib2, glusterfs-api
+Requires(pre): kmod, zlib, libnl3, glib2
 
 %description
 A daemon that handles the userspace side of the LIO TCM-User backstore.
@@ -43,7 +43,7 @@ userspace libraries they like.
 %setup -n %{name}-%{version}%{?_RC:-%{_RC}}
 
 %build
-%{__cmake} -DSUPPORT_SYSTEMD=ON -DCMAKE_INSTALL_PREFIX=%{_usr} .
+%{__cmake} -DSUPPORT_SYSTEMD=ON -DCMAKE_INSTALL_PREFIX=%{_usr} -Dwith-glfs=false -Dwith-qcow=false .
 %{__make}
 
 %install

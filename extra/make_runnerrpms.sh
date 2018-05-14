@@ -21,9 +21,10 @@ if [ ! -e $TOPDIR/.git ]; then
 	exit
 fi
 
-VERSION=`git describe --tags --match "v[0-9]*"`
-VERSION=`echo $VERSION | sed "s/-/./g"`
-VERSION=`echo $VERSION | sed "s/v//"`
+#VERSION=`git describe --tags --match "v[0-9]*"`
+#VERSION=`echo $VERSION | sed "s/-/./g"`
+#VERSION=`echo $VERSION | sed "s/v//"`
+VERSION="1.3.0"
 TCMURUNNER_TAR=tcmu-runner-$VERSION.tar.gz
 rpmbuild_path=`pwd`/rpmbuild
 
@@ -47,7 +48,7 @@ sed -i "s/Version:.*$/Version:       ${VERSION}/" $SPEC
 # Delete all the _RC code if exists
 LN=`grep -n "define" $SPEC |grep _RC | awk -F: '{print $1}'`
 sed -i "${LN}d" $SPEC
-sed -i "s/%{?_RC:%{_RC}}/0/g" $SPEC
+sed -i "s/%{?_RC:%{_RC}}/1/g" $SPEC
 sed -i "s/%{?_RC:-%{_RC}}//g" $SPEC
 
 # Generate the source package
