@@ -1,11 +1,11 @@
 #!/bin/sh
 
-if [ $# -gt 0 -o "$1" == "--help" -o "$1" == "help" ]; then
+if [ "$1" == "--help" -o "$1" == "help" ]; then
 	echo ""
 	echo "  USAGE:"
 	echo ""
 	echo "  # cd tcmu-runner/extra/"
-	echo "  # ./make_runnerrpms.sh"
+	echo "  # ./make_runnerrpms.sh [--without (rbd|glfs|qcow|zbc|fbo)]"
 	echo ""
 	echo "  Will build the RPMs in current dir by using the HEAD commit ID as default."
 	echo ""
@@ -21,9 +21,10 @@ if [ ! -e $TOPDIR/.git ]; then
 	exit
 fi
 
-VERSION=`git describe --tags --match "v[0-9]*"`
-VERSION=`echo $VERSION | sed "s/-/./g"`
-VERSION=`echo $VERSION | sed "s/v//"`
+#VERSION=`git describe --tags --match "v[0-9]*"`
+#VERSION=`echo $VERSION | sed "s/-/./g"`
+#VERSION=`echo $VERSION | sed "s/v//"`
+VERSION="1.4.2"
 TCMURUNNER_TAR=tcmu-runner-$VERSION.tar.gz
 rpmbuild_path=`pwd`/rpmbuild
 
@@ -47,7 +48,7 @@ sed -i "s/Version:.*$/Version:       ${VERSION}/" $SPEC
 # Delete all the _RC code if exists
 LN=`grep -n "define" $SPEC |grep _RC | awk -F: '{print $1}'`
 sed -i "${LN}d" $SPEC
-sed -i "s/%{?_RC:%{_RC}}/0/g" $SPEC
+sed -i "s/%{?_RC:%{_RC}}/1/g" $SPEC
 sed -i "s/%{?_RC:-%{_RC}}//g" $SPEC
 
 # Generate the source package
@@ -62,4 +63,4 @@ cd $TOPDIR/extra
 rm -rf $TMPDIR
 
 # Build the RPMs
-rpmbuild --define="_topdir $rpmbuild_path" -ba $rpmbuild_path/SPECS/tcmu-runner.spec
+rpmbuild --define="_topdir $rpmbuild_path" -ba $rpmbuild_path/SPECS/tcmu-runner.spec "$@"

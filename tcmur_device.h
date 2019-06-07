@@ -15,6 +15,8 @@
 
 #include "tcmur_aio.h"
 
+#define TCMU_INVALID_LOCK_TAG USHRT_MAX
+
 #define TCMUR_DEV_FLAG_FORMATTING	(1 << 0)
 #define TCMUR_DEV_FLAG_IN_RECOVERY	(1 << 1)
 #define TCMUR_DEV_FLAG_IS_OPEN		(1 << 2)
@@ -24,19 +26,21 @@
 #define TCMUR_UA_DEV_SIZE_CHANGED	0
 
 enum {
-	TMCUR_DEV_FAILOVER_ALL_ACTIVE,
-	TMCUR_DEV_FAILOVER_IMPLICIT,
-	TMCUR_DEV_FAILOVER_EXPLICIT,
+	TCMUR_DEV_FAILOVER_ALL_ACTIVE,
+	TCMUR_DEV_FAILOVER_IMPLICIT,
+	TCMUR_DEV_FAILOVER_EXPLICIT,
 };
 
 enum {
 	TCMUR_DEV_LOCK_UNLOCKED,
 	TCMUR_DEV_LOCK_LOCKED,
 	TCMUR_DEV_LOCK_LOCKING,
+	TCMUR_DEV_LOCK_UNKNOWN,
 };
 
 struct tcmur_device {
 	struct tcmu_device *dev;
+	void *hm_private;
 
 	pthread_t cmdproc_thread;
 
@@ -47,6 +51,7 @@ struct tcmur_device {
 	pthread_t recovery_thread;
 	struct list_node recovery_entry;
 
+	bool lock_lost;
 	uint8_t lock_state;
 	pthread_t lock_thread;
 	pthread_cond_t lock_cond;
@@ -77,11 +82,15 @@ int tcmu_cancel_lock_thread(struct tcmu_device *dev);
 void tcmu_notify_conn_lost(struct tcmu_device *dev);
 void tcmu_notify_lock_lost(struct tcmu_device *dev);
 
-int __tcmu_reopen_dev(struct tcmu_device *dev, bool in_lock_thread, int retries);
-int tcmu_reopen_dev(struct tcmu_device *dev, bool in_lock_thread, int retries);
+int __tcmu_reopen_dev(struct tcmu_device *dev, int retries);
+int tcmu_reopen_dev(struct tcmu_device *dev, int retries);
 
-int tcmu_acquire_dev_lock(struct tcmu_device *dev, bool is_sync, uint16_t tag);
+int tcmu_acquire_dev_lock(struct tcmu_device *dev, uint16_t tag);
 void tcmu_release_dev_lock(struct tcmu_device *dev);
 int tcmu_get_lock_tag(struct tcmu_device *dev, uint16_t *tag);
+void tcmu_update_dev_lock_state(struct tcmu_device *dev);
+
+void tcmur_dev_set_private(struct tcmu_device *dev, void *private);
+void *tcmur_dev_get_private(struct tcmu_device *dev);
 
 #endif

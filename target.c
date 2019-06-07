@@ -52,7 +52,7 @@ static int tcmu_set_tpg_int(struct tgt_port_grp *tpg, const char *name,
 
 	snprintf(path, sizeof(path), CFGFS_ROOT"/%s/%s/tpgt_%hu/%s",
 		 tpg->fabric, tpg->wwn, tpg->tpgt, name);
-	return tcmu_set_cfgfs_ul(path, val);
+	return tcmu_cfgfs_set_u32(path, val);
 }
 
 static int tcmu_get_tpg_int(struct tgt_port *port, const char *name)
@@ -62,7 +62,7 @@ static int tcmu_get_tpg_int(struct tgt_port *port, const char *name)
 	snprintf(path, sizeof(path),
 		 CFGFS_ROOT"/%s/%s/tpgt_%hu/%s",
 		 port->fabric, port->wwn, port->tpgt, name);
-	return tcmu_get_cfgfs_int(path);
+	return tcmu_cfgfs_get_int(path);
 }
 
 static int tcmu_get_lun_int_stat(struct tgt_port *port, uint64_t lun,
@@ -73,7 +73,7 @@ static int tcmu_get_lun_int_stat(struct tgt_port *port, uint64_t lun,
 	snprintf(path, sizeof(path),
 		 CFGFS_ROOT"/%s/%s/tpgt_%hu/lun/lun_%"PRIu64"/statistics/%s",
 		 port->fabric, port->wwn, port->tpgt, lun, stat_name);
-	return tcmu_get_cfgfs_int(path);
+	return tcmu_cfgfs_get_int(path);
 }
 
 void tcmu_free_tgt_port(struct tgt_port *port)
@@ -235,7 +235,7 @@ static void *tgt_port_grp_recovery_thread_fn(void *arg)
 
 	if (ret < 0) {
 		tcmu_err("Could not disable %s/%s/tpgt_%hu (err %d).\n",
-			 ret, tpg->fabric, tpg->wwn, tpg->tpgt);
+			 tpg->fabric, tpg->wwn, tpg->tpgt, ret);
 		/* just recover the devs and leave the tpg in curr state */
 		goto done;
 	}
@@ -250,7 +250,8 @@ done:
 	 * cmdproc thread to reopen all these in parallel.
 	 */
 	list_for_each_safe(&tpg->devs, rdev, tmp_rdev, recovery_entry) {
-		ret = __tcmu_reopen_dev(rdev->dev, false, -1);
+		list_del(&rdev->recovery_entry);
+		ret = __tcmu_reopen_dev(rdev->dev, -1);
 		if (ret) {
 			tcmu_dev_err(rdev->dev, "Could not reinitialize device. (err %d).\n",
 				     ret);
@@ -264,7 +265,7 @@ done:
 		ret = tcmu_set_tpg_int(tpg, "enable", 1);
 		if (ret) {
 			tcmu_err("Could not enable %s/%s/tpgt_%hu (err %d).\n",
-				 ret, tpg->fabric, tpg->wwn, tpg->tpgt);
+				 tpg->fabric, tpg->wwn, tpg->tpgt, ret);
 		} else {
 			tcmu_info("Enabled %s/%s/tpgt_%hu.\n", tpg->fabric, tpg->wwn,
 				  tpg->tpgt);
@@ -272,12 +273,12 @@ done:
 	}
 
 	free_tgt_port_grp(tpg);
-        return NULL;
+	return NULL;
 }
 
 int tcmu_add_dev_to_recovery_list(struct tcmu_device *dev)
 {
-	struct tcmur_device *rdev = tcmu_get_daemon_dev_private(dev);
+	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
 	struct list_head alua_list;
 	struct alua_grp *group;
 	struct tgt_port_grp *tpg;

@@ -35,11 +35,12 @@ We encourage pull requests and issues tracking via Github, and the [target-devel
 1. Clone this repo.
 1. Type `./extra/install_dep.sh` to install development packages for dependencies, or you can do it manually:
    * *Note:* Install cmake and other packages which usually ending with "-devel" or "-dev": libnl3, libglib2 (or glib2-devel on Fedora), libpthread, libdl, libkmod, libgfapi (Gluster), librbd1 (Ceph), zlib.
-1. Type `cmake .`
-   * *Note:* tcmu-runner can be compiled without the Gluster or qcow handlers using the `-Dwith-glfs=false` and `-Dwith-qcow=false` cmake parameters respectively.
+1. Type `cd ./extra && ./make_runnerrpms.sh [--without (rbd|glfs|qcow|zbc|fbo)]` to build the RPM packages automatically.
+1. Type `cmake . [-Dwith-<rbd|glfs|qcow|zbc|fbo>=false]`
    * *Note:* If using systemd, `-DSUPPORT_SYSTEMD=ON -DCMAKE_INSTALL_PREFIX=/usr` should be passed to cmake, so files are installed to the correct location.
 1. Type `make`
 1. Type `make install`
+1. Type `xargs rm < install_manifest.txt` to uninstall from source
 
 
 ##### Running tcmu-runner
@@ -140,8 +141,8 @@ backstores.
 
 - Logger setting:
 
-There are 5 logging levels supported:
-
+# There are 6 logging levels supported:
+0. CRIT
 1. ERROR
 2. WARNING
 3. INFO
@@ -153,15 +154,15 @@ uncomment the following line in /etc/tcmu/tcmu.conf and set your level number:
 
 \# log_level = 3
 
-The priority of the logdir setting can be managed via following options:
-
-1. Cli argument
-</br>eg: --tcmu_log_dir/-l `LOG_DIR_PATH` [Highest prio]
-2. Environment variable
+The precedence of the config settings is as mentioned belows:
+1. Options set through config file /etc/tcmu/tcmu.conf  [Top Prio]
+</br>eg: uncommenting and adjusting key:value at /etc/tcmu/tcmu.conf
+2. Arguments passed at daemon
+</br>eg: -l/--tcmu-log-dir, -d/--debug
+3. Environment variable.
 </br>eg: export TCMU_LOGDIR="/var/log/mylogdir/"
-3. Configuration file
-</br>eg: uncommenting and adjusting value of 'log_dir_path' at /etc/tcmu/tcmu.conf
-4. Default logdir as hard coded i.e. '/var/log/' [Least prio]
+4. Code level defaults.  [Least Prio]
+</br>eg: TCMU_LOG_DIR_DEFAULT = '/var/log/' & TCMU_CONF_LOG_INFO = INFO
 
 - System configuration:
 

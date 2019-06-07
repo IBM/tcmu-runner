@@ -1,6 +1,6 @@
 cmake_minimum_required (VERSION 2.8 FATAL_ERROR)
 project (tcmu-runner C)
-set(VERSION 1.4.0-rc1)
+set(VERSION 1.4.0)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Werror -Wall -Wdeclaration-after-statement -std=c99")
 
 include(GNUInstallDirs)
@@ -11,6 +11,9 @@ set(tcmu-runner_HANDLER_PATH "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/tc
 option(with-glfs "build Gluster glfs handler" true)
 option(with-qcow "build qcow handler" true)
 option(with-rbd "build Ceph rbd handler" true)
+option(with-zbc "build zbc handler" true)
+option(with-fbo "build fbo handler" true)
+option(with-tcmalloc "link against tcmalloc" true)
 
 find_library(LIBNL_LIB nl-3)
 find_library(LIBNL_GENL_LIB nl-genl-3)
@@ -32,6 +35,10 @@ pkg_check_modules(KMOD REQUIRED libkmod)
 
 find_library(PTHREAD pthread)
 find_library(DL dl)
+
+if (with-tcmalloc)
+  find_library(TCMALLOC_LIB tcmalloc)
+endif(with-tcmalloc)
 
 # Stuff for building the shared library
 add_library(tcmu
@@ -60,7 +67,7 @@ target_link_libraries(tcmu
   ${LIBNL_GENL_LIB}
   ${GLIB_LIBRARIES}
   )
-install(TARGETS tcmu LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} NAMELINK_SKIP)
+install(TARGETS tcmu LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
 # Stuff for building the static library
 add_library(tcmu_static
@@ -90,6 +97,7 @@ add_executable(tcmu-runner
   tcmur_device.c
   target.c
   alua.c
+  scsi.c
   main.c
   tcmuhandler-generated.c
   )
@@ -105,12 +113,14 @@ target_link_libraries(tcmu-runner
   ${PTHREAD}
   ${DL}
   ${KMOD_LIBRARIES}
+  ${TCMALLOC_LIB}
   -Wl,--no-export-dynamic
   -Wl,--dynamic-list=${CMAKE_SOURCE_DIR}/main-syms.txt
   )
 install(TARGETS tcmu-runner RUNTIME DESTINATION bin)
 
 add_executable(tcmu-synthesizer
+  scsi.c
   tcmu-synthesizer.c
   )
 target_link_libraries(tcmu-synthesizer tcmu)
@@ -154,39 +164,47 @@ target_include_directories(handler_file
   PUBLIC ${PROJECT_SOURCE_DIR}/ccan
   )
 
-# Stuff for building the file optical handler
-add_library(handler_file_optical
-  SHARED
-  file_optical.c
-  )
-set_target_properties(handler_file_optical
-  PROPERTIES
-  PREFIX ""
-  )
-target_include_directories(handler_file_optical
-  PUBLIC ${PROJECT_SOURCE_DIR}/ccan
-  )
-target_link_libraries(handler_file_optical ${PTHREAD})
-
-# Stuff for building the file zbc handler
-add_library(handler_file_zbc
-  SHARED
-  file_zbc.c
-  )
-set_target_properties(handler_file_zbc
-  PROPERTIES
-  PREFIX ""
-  )
-target_include_directories(handler_file_zbc
-  PUBLIC ${PROJECT_SOURCE_DIR}/ccan
-  )
-install(TARGETS handler_file_zbc DESTINATION ${CMAKE_INSTALL_LIBDIR}/tcmu-runner)
+if (with-fbo)
+	# Stuff for building the file optical handler
+	add_library(handler_file_optical
+  	SHARED
+	scsi.c
+  	file_optical.c
+  	)
+	set_target_properties(handler_file_optical
+  	PROPERTIES
+  	PREFIX ""
+  	)
+	target_include_directories(handler_file_optical
+  	PUBLIC ${PROJECT_SOURCE_DIR}/ccan
+  	)
+	target_link_libraries(handler_file_optical ${PTHREAD})
+	install(TARGETS handler_file_optical DESTINATION ${CMAKE_INSTALL_LIBDIR}/tcmu-runner)
+endif (with-fbo)
 
 # The minimal library consumer
 add_executable(consumer
+  scsi.c
   consumer.c
   )
 target_link_libraries(consumer tcmu)
+
+if (with-zbc)
+	# Stuff for building the file zbc handler
+	add_library(handler_file_zbc
+	  SHARED
+	  scsi.c
+	  file_zbc.c
+	  )
+	set_target_properties(handler_file_zbc
+	  PROPERTIES
+	  PREFIX ""
+	  )
+	target_include_directories(handler_file_zbc
+	  PUBLIC ${PROJECT_SOURCE_DIR}/ccan
+	  )
+	install(TARGETS handler_file_zbc DESTINATION ${CMAKE_INSTALL_LIBDIR}/tcmu-runner)
+endif (with-zbc)
 
 if (with-rbd)
 	find_library(LIBRBD rbd)
@@ -211,6 +229,13 @@ endif (with-rbd)
 
 if (with-glfs)
 	find_library(GFAPI gfapi)
+
+    set(GFAPI_VERSION760 0)
+
+    pkg_check_modules(GFAPI760 glusterfs-api>=7.6 QUIET)
+	if (GFAPI760_FOUND)
+		set(GFAPI_VERSION760 1)
+	endif (GFAPI760_FOUND)
 
 	# Stuff for building the glfs handler
 	add_library(handler_glfs
@@ -272,6 +297,14 @@ configure_file (
   )
 install(SCRIPT tcmu.conf_install.cmake)
 
+configure_file (
+  "${PROJECT_SOURCE_DIR}/logrotate.conf_install.cmake.in"
+  "${PROJECT_SOURCE_DIR}/logrotate.conf_install.cmake"
+  )
+install(SCRIPT logrotate.conf_install.cmake)
+
+install(FILES libtcmu.h libtcmu_common.h
+  DESTINATION include)
 install(FILES org.kernel.TCMUService1.service
   DESTINATION /usr/share/dbus-1/system-services)
 install(FILES tcmu-runner.conf DESTINATION /etc/dbus-1/system.d)

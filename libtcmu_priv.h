@@ -16,15 +16,10 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-#include <sys/uio.h>
 #include <gio/gio.h>
 #include <pthread.h>
 
-#include "scsi_defs.h"
 #include "darray.h"
-#include "ccan/list/list.h"
-#include "tcmur_aio.h"
-#include "tcmu-runner.h"
 
 #define KERN_IFACE_VER 2
 
@@ -51,10 +46,14 @@ struct tcmu_device {
 	uint64_t num_lbas;
 	uint32_t block_size;
 	uint32_t max_xfer_len;
+	uint32_t opt_xcopy_rw_len;
+	bool split_unmaps;
+	uint32_t max_unmap_len;
 	uint32_t opt_unmap_gran;
 	uint32_t unmap_gran_align;
 	unsigned int write_cache_enabled:1;
 	unsigned int solid_state_media:1;
+	unsigned int unmap_enabled:1;
 
 	char dev_name[16]; /* e.g. "uio14" */
 	char tcm_hba_name[16]; /* e.g. "user_8" */
@@ -64,7 +63,6 @@ struct tcmu_device {
 	struct tcmulib_handler *handler;
 	struct tcmulib_context *ctx;
 
-	void *d_private; /* private ptr for the daemon */
 	void *hm_private; /* private ptr for handler module */
 };
 

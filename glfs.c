@@ -26,12 +26,13 @@
 #include "libtcmu.h"
 #include "tcmur_device.h"
 #include "tcmur_cmd_handler.h"
+#include "version.h"
 
 #define ALLOWED_BSOFLAGS (O_DIRECT | O_RDWR | O_LARGEFILE)
 
 #define GLUSTER_PORT "24007"
 #define TCMU_GLFS_LOG_FILENAME "tcmu-runner-glfs.log"  /* MAX 32 CHAR */
-#define TCMU_GLFS_DEBUG_LEVEL  4
+#define TCMU_GLFS_DEBUG_LEVEL  7
 
 /* cache protection */
 pthread_mutex_t glfs_lock;
@@ -86,7 +87,8 @@ typedef struct glfs_cbk_cookie {
 		TCMU_GLFS_READ  = 1,
 		TCMU_GLFS_WRITE = 2,
 		TCMU_GLFS_FLUSH = 3,
-		TCMU_GLFS_DISCARD = 4
+		TCMU_GLFS_DISCARD = 4,
+		TCMU_GLFS_WRITESAME = 5
 	} op;
 } glfs_cbk_cookie;
 
@@ -99,14 +101,12 @@ struct gluster_cacheconn {
 
 static darray(struct gluster_cacheconn *) glfs_cache = darray_new();
 
-
 const char *const gluster_transport_lookup[] = {
 	[GLUSTER_TRANSPORT_TCP] = "tcp",
 	[GLUSTER_TRANSPORT_UNIX] = "unix",
 	[GLUSTER_TRANSPORT_RDMA] = "rdma",
 	[GLUSTER_TRANSPORT__MAX] = NULL,
 };
-
 
 static void gluster_free_host(gluster_hostdef *host)
 {
@@ -134,19 +134,19 @@ gluster_compare_hosts(gluster_hostdef *src_server, gluster_hostdef *dst_server)
 		return false;
 
 	switch (src_server->type) {
-		case GLUSTER_TRANSPORT_UNIX:
-			if (!strcmp(src_server->u.uds.socket, dst_server->u.uds.socket))
-				return true;
-			break;
-		case GLUSTER_TRANSPORT_TCP:
-		case GLUSTER_TRANSPORT_RDMA:
-			if (!strcmp(src_server->u.inet.addr, dst_server->u.inet.addr)
-					&&
-				!strcmp(src_server->u.inet.port, dst_server->u.inet.port))
-				return true;
-			break;
-		case GLUSTER_TRANSPORT__MAX:
-			break;
+	case GLUSTER_TRANSPORT_UNIX:
+		if (!strcmp(src_server->u.uds.socket, dst_server->u.uds.socket))
+			return true;
+		break;
+	case GLUSTER_TRANSPORT_TCP:
+	case GLUSTER_TRANSPORT_RDMA:
+		if (!strcmp(src_server->u.inet.addr, dst_server->u.inet.addr)
+				&&
+			!strcmp(src_server->u.inet.port, dst_server->u.inet.port))
+			return true;
+		break;
+	case GLUSTER_TRANSPORT__MAX:
+		break;
 	}
 
 	return false;
@@ -190,8 +190,31 @@ free_entry:
 	if (entry->volname)
 		free(entry->volname);
 	free(entry);
- error:
+error:
 	return -1;
+}
+
+static bool tcmu_glfs_update_logdir(void)
+{
+	struct gluster_cacheconn **entry;
+	char logfilepath[PATH_MAX];
+	int ret;
+
+	darray_foreach(entry, glfs_cache) {
+		ret = tcmu_make_absolute_logfile(logfilepath, TCMU_GLFS_LOG_FILENAME);
+		if (ret < 0) {
+			tcmu_err("tcmu_make_absolute_logfile failed: %d\n", ret);
+			return false;
+		}
+
+		if (glfs_set_logging((*entry)->fs, logfilepath, TCMU_GLFS_DEBUG_LEVEL)) {
+			tcmu_err("glfs_set_logging() on %s failed[%s]",
+				 (*entry)->volname, strerror(errno));
+			return false;
+		}
+	}
+
+	return true;
 }
 
 static glfs_t* gluster_cache_query(gluster_server *dst, char *cfgstring)
@@ -301,7 +324,7 @@ static int gluster_cache_query_or_add(struct tcmu_device *dev,
 		goto out;
 	}
 
- out:
+out:
 	pthread_mutex_unlock(&glfs_lock);
 	pthread_cleanup_pop(0);
 
@@ -343,12 +366,12 @@ static int parse_imagepath(char *cfgstring, gluster_server **hosts)
 
 	*hosts = calloc(1, sizeof(gluster_server));
 	if (!hosts)
-                goto fail;
+		goto fail;
 	entry = *hosts;
 
 	entry->server = calloc(1, sizeof(gluster_hostdef));
 	if (!entry->server)
-                goto fail;
+		goto fail;
 
 	*sep = '\0';
 	entry->volname = strdup(p);
@@ -418,9 +441,8 @@ static glfs_t* tcmu_create_glfs_object(struct tcmu_device *dev,
 		goto fail;
 	}
 
-	if (!init) {
+	if (!init)
 		return fs;
-	}
 
 	ret = glfs_set_volfile_server(fs,
 				gluster_transport_lookup[entry->server->type],
@@ -453,10 +475,10 @@ static glfs_t* tcmu_create_glfs_object(struct tcmu_device *dev,
 
 	return fs;
 
- unref:
+unref:
 	gluster_cache_refresh(fs, config);
 
- fail:
+fail:
 	gluster_free_server(hosts);
 	return NULL;
 }
@@ -465,7 +487,7 @@ static char* tcmu_get_path( struct tcmu_device *dev)
 {
 	char *config;
 
-	config = strchr(tcmu_get_dev_cfgstring(dev), '/');
+	config = strchr(tcmu_dev_get_cfgstring(dev), '/');
 	if (!config) {
 		tcmu_dev_err(dev, "no configuration found in cfgstring\n");
 		return NULL;
@@ -482,19 +504,18 @@ static int tcmu_glfs_open(struct tcmu_device *dev, bool reopen)
 	struct stat st;
 	int ret = -EIO;
 	long long dev_size;
-	uint32_t block_size = tcmu_get_dev_block_size(dev);
+	uint32_t block_size = tcmu_dev_get_block_size(dev);
 
 	gfsp = calloc(1, sizeof(*gfsp));
 	if (!gfsp)
 		return -ENOMEM;
 
-	tcmu_set_dev_private(dev, gfsp);
-	tcmu_set_dev_write_cache_enabled(dev, 1);
+	tcmur_dev_set_private(dev, gfsp);
+	tcmu_dev_set_write_cache_enabled(dev, 1);
 
 	config = tcmu_get_path(dev);
-	if (!config) {
+	if (!config)
 		goto fail;
-	}
 
 	gfsp->fs = tcmu_create_glfs_object(dev, config, &gfsp->hosts);
 	if (!gfsp->fs) {
@@ -515,7 +536,7 @@ static int tcmu_glfs_open(struct tcmu_device *dev, bool reopen)
 		goto close;
 	}
 
-	dev_size = tcmu_get_dev_num_lbas(dev) * block_size;
+	dev_size = tcmu_dev_get_num_lbas(dev) * block_size;
 	if (st.st_size != dev_size) {
 		/*
 		 * The glfs allows the backend file size not to align
@@ -559,7 +580,7 @@ fail:
 
 static void tcmu_glfs_close(struct tcmu_device *dev)
 {
-	struct glfs_state *gfsp = tcmu_get_dev_private(dev);
+	struct glfs_state *gfsp = tcmur_dev_get_private(dev);
 
 	glfs_close(gfsp->gfd);
 	gluster_cache_refresh(gfsp->fs, tcmu_get_path(dev));
@@ -567,7 +588,14 @@ static void tcmu_glfs_close(struct tcmu_device *dev)
 	free(gfsp);
 }
 
+#if GFAPI_VERSION760
+static void glfs_async_cbk(glfs_fd_t *fd, ssize_t ret,
+			   struct glfs_stat *prestat,
+			   struct glfs_stat *poststat,
+			   void *data)
+#else
 static void glfs_async_cbk(glfs_fd_t *fd, ssize_t ret, void *data)
+#endif
 {
 	glfs_cbk_cookie *cookie = data;
 	struct tcmu_device *dev = cookie->dev;
@@ -583,6 +611,7 @@ static void glfs_async_cbk(glfs_fd_t *fd, ssize_t ret, void *data)
 		case TCMU_GLFS_WRITE:
 		case TCMU_GLFS_FLUSH:
 		case TCMU_GLFS_DISCARD:
+		case TCMU_GLFS_WRITESAME:
 			ret = TCMU_STS_WR_ERR;
 			break;
 		}
@@ -599,7 +628,7 @@ static int tcmu_glfs_read(struct tcmu_device *dev,
                           struct iovec *iov, size_t iov_cnt,
                           size_t length, off_t offset)
 {
-	struct glfs_state *state = tcmu_get_dev_private(dev);
+	struct glfs_state *state = tcmur_dev_get_private(dev);
 	glfs_cbk_cookie *cookie;
 
 	cookie = calloc(1, sizeof(*cookie));
@@ -631,7 +660,7 @@ static int tcmu_glfs_write(struct tcmu_device *dev,
                            struct iovec *iov, size_t iov_cnt,
                            size_t length, off_t offset)
 {
-	struct glfs_state *state = tcmu_get_dev_private(dev);
+	struct glfs_state *state = tcmur_dev_get_private(dev);
 	glfs_cbk_cookie *cookie;
 
 	cookie = calloc(1, sizeof(*cookie));
@@ -661,7 +690,7 @@ out:
 static int tcmu_glfs_reconfig(struct tcmu_device *dev,
                               struct tcmulib_cfg_info *cfg)
 {
-	struct glfs_state *gfsp = tcmu_get_dev_private(dev);
+	struct glfs_state *gfsp = tcmur_dev_get_private(dev);
 	struct stat st;
 	int ret = -EIO;
 
@@ -676,7 +705,7 @@ static int tcmu_glfs_reconfig(struct tcmu_device *dev,
 			ret = 0;
 		} else if (st.st_size != cfg->data.dev_size) {
 			tcmu_dev_err(dev,
-				     "device size and backing size disagree: device %lld backing %lld\n",
+				     "device size and backing size disagree: device %"PRId64" backing %lld\n",
 				     cfg->data.dev_size, (long long) st.st_size);
 			ret = -EINVAL;
 		}
@@ -691,7 +720,7 @@ static int tcmu_glfs_reconfig(struct tcmu_device *dev,
 static int tcmu_glfs_flush(struct tcmu_device *dev,
                            struct tcmulib_cmd *cmd)
 {
-	struct glfs_state *state = tcmu_get_dev_private(dev);
+	struct glfs_state *state = tcmur_dev_get_private(dev);
 	glfs_cbk_cookie *cookie;
 
 	cookie = calloc(1, sizeof(*cookie));
@@ -720,7 +749,7 @@ out:
 static int tcmu_glfs_discard(struct tcmu_device *dev, struct tcmulib_cmd *cmd,
                              uint64_t offset, uint64_t length)
 {
-	struct glfs_state *state = tcmu_get_dev_private(dev);
+	struct glfs_state *state = tcmur_dev_get_private(dev);
 	glfs_cbk_cookie *cookie;
 	ssize_t ret;
 
@@ -746,6 +775,65 @@ static int tcmu_glfs_discard(struct tcmu_device *dev, struct tcmulib_cmd *cmd,
 out:
 	free(cookie);
 	return TCMU_STS_NO_RESOURCE;
+}
+
+static int tcmu_glfs_writesame(struct tcmu_device *dev,
+			       struct tcmulib_cmd *cmd,
+			       uint64_t offset, uint64_t length,
+			       struct iovec *iov, size_t iov_cnt)
+{
+	struct glfs_state *state = tcmur_dev_get_private(dev);
+	glfs_cbk_cookie *cookie;
+	ssize_t ret;
+
+	if (!tcmu_iovec_zeroed(iov, iov_cnt)) {
+		tcmu_dev_warn(dev,
+			      "Received none zeroed data, will fall back to writesame emulator instead.\n");
+		return TCMU_STS_NOT_HANDLED;
+	}
+
+	cookie = calloc(1, sizeof(*cookie));
+	if (!cookie) {
+		tcmu_dev_err(dev, "Could not allocate cookie: %m\n");
+		goto out;
+	}
+	cookie->dev = dev;
+	cookie->cmd = cmd;
+	cookie->length = 0;
+	cookie->op = TCMU_GLFS_WRITESAME;
+
+	ret = glfs_zerofill_async(state->gfd, offset, length, glfs_async_cbk, cookie);
+	if (ret < 0) {
+		tcmu_dev_err(dev, "glfs_zerofill_async(vol=%s, file=%s) failed: %m\n",
+		             state->hosts->volname, state->hosts->path);
+		goto out;
+	}
+
+	return TCMU_STS_OK;
+
+out:
+	free(cookie);
+	return TCMU_STS_NO_RESOURCE;
+}
+
+/*
+ * Return scsi status or TCMU_STS_NOT_HANDLED
+ */
+static int tcmu_glfs_handle_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
+{
+	uint8_t *cdb = cmd->cdb;
+	int ret;
+
+	switch(cdb[0]) {
+	case WRITE_SAME:
+	case WRITE_SAME_16:
+		ret = tcmur_handle_writesame(dev, cmd, tcmu_glfs_writesame);
+		break;
+	default:
+		ret = TCMU_STS_NOT_HANDLED;
+	}
+
+	return ret;
 }
 
 /*
@@ -780,6 +868,9 @@ struct tcmur_handler glfs_handler = {
 	.reconfig       = tcmu_glfs_reconfig,
 	.flush          = tcmu_glfs_flush,
 	.unmap          = tcmu_glfs_discard,
+	.handle_cmd     = tcmu_glfs_handle_cmd,
+
+	.update_logdir  = tcmu_glfs_update_logdir,
 };
 
 /* Entry point must be named "handler_init". */
@@ -788,14 +879,12 @@ int handler_init(void)
 	int ret;
 
 	ret = pthread_mutex_init(&glfs_lock, NULL);
-	if (ret != 0) {
+	if (ret != 0)
 		return -1;
-	}
 
 	ret = tcmur_register_handler(&glfs_handler);
-	if (ret != 0) {
+	if (ret != 0)
 		pthread_mutex_destroy(&glfs_lock);
-	}
 
 	return ret;
 }

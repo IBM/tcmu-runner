@@ -12,7 +12,7 @@
  */
 
 #define _GNU_SOURCE
-#define _BITS_UIO_H
+#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <limits.h>
@@ -48,13 +48,20 @@
 #include "libtcmu_config.h"
 #include "libtcmu_log.h"
 
-# define TCMU_LOCK_FILE   "/var/run/lock/tcmu.lock"
+#define TCMU_LOCK_FILE   "/run/tcmu.lock"
 
 static char *handler_path = DEFAULT_HANDLER_PATH;
 
 static struct tcmu_config *tcmu_cfg;
 
 darray(struct tcmur_handler *) g_runner_handlers = darray_new();
+
+struct tcmur_handler *tcmu_get_runner_handler(struct tcmu_device *dev)
+{
+	struct tcmulib_handler *handler = tcmu_dev_get_handler(dev);
+
+	return handler->hm_private;
+}
 
 int tcmur_register_handler(struct tcmur_handler *handler)
 {
@@ -182,12 +189,18 @@ static int open_handlers(void)
 	return num_good;
 }
 
-static gboolean sighandler(gpointer user_data)
+static gboolean handle_sig(gpointer user_data)
 {
 	tcmu_dbg("Have received signal!\n");
 
 	g_main_loop_quit((GMainLoop*)user_data);
 
+	return G_SOURCE_CONTINUE;
+}
+
+static gboolean handle_sighup(gpointer user_data)
+{
+	tcmu_resetup_log_file(NULL, NULL);
 	return G_SOURCE_CONTINUE;
 }
 
@@ -532,14 +545,23 @@ static int load_our_module(void)
 			if (err == 0) {
 				tcmu_info("Inserted module '%s'\n",
 				          kmod_module_get_name(mod));
-			} else if (err == KMOD_PROBE_APPLY_BLACKLIST) {
-				tcmu_err("Module '%s' is blacklisted\n",
-				         kmod_module_get_name(mod));
+			} else if (err < 0) {
+				tcmu_err("Failed to insert '%s': %s\n",
+				         kmod_module_get_name(mod), strerror(-err));
+				ret = err;
 			} else {
-				tcmu_err("Failed to insert '%s'\n",
-				         kmod_module_get_name(mod));
+				switch (err) {
+				case KMOD_PROBE_APPLY_BLACKLIST:
+					tcmu_err("Module '%s' is blacklisted\n",
+					         kmod_module_get_name(mod));
+					break;
+				default:
+					tcmu_err("Module '%s' is stopped by a reason: 0x%x\n",
+					         kmod_module_get_name(mod), err);
+					break;
+				}
+				ret = -EIO;
 			}
-			ret = err;
 		}
 		kmod_module_unref(mod);
 	}
@@ -561,7 +583,7 @@ static void tcmur_stop_device(void *arg)
 {
 	struct tcmu_device *dev = arg;
 	struct tcmur_handler *rhandler = tcmu_get_runner_handler(dev);
-	struct tcmur_device *rdev = tcmu_get_daemon_dev_private(dev);
+	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
 	bool is_open = false;
 
 	pthread_mutex_lock(&rdev->state_lock);
@@ -580,6 +602,8 @@ static void tcmur_stop_device(void *arg)
 	tcmu_cancel_lock_thread(dev);
 	tcmu_cancel_recovery(dev);
 
+	tcmu_release_dev_lock(dev);
+
 	pthread_mutex_lock(&rdev->state_lock);
 	if (rdev->flags & TCMUR_DEV_FLAG_IS_OPEN) {
 		rdev->flags &= ~TCMUR_DEV_FLAG_IS_OPEN;
@@ -587,10 +611,8 @@ static void tcmur_stop_device(void *arg)
 	}
 	pthread_mutex_unlock(&rdev->state_lock);
 
-	if (is_open) {
-		tcmu_release_dev_lock(dev);
+	if (is_open)
 		rhandler->close(dev);
-	}
 
 	pthread_mutex_lock(&rdev->state_lock);
 	rdev->flags |= TCMUR_DEV_FLAG_STOPPED;
@@ -603,7 +625,7 @@ static void *tcmur_cmdproc_thread(void *arg)
 {
 	struct tcmu_device *dev = arg;
 	struct tcmur_handler *rhandler = tcmu_get_runner_handler(dev);
-	struct tcmur_device *rdev = tcmu_get_daemon_dev_private(dev);
+	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
 	struct pollfd pfd;
 	int ret;
 	bool dev_stopping = false;
@@ -619,7 +641,7 @@ static void *tcmur_cmdproc_thread(void *arg)
 		while (!dev_stopping && (cmd = tcmulib_get_next_command(dev)) != NULL) {
 
 			if (tcmu_get_log_level() == TCMU_LOG_DEBUG_SCSI_CMD)
-				tcmu_print_cdb_info(dev, cmd, NULL);
+				tcmu_cdb_print_info(dev, cmd, NULL);
 
 			if (tcmur_handler_is_passthrough_only(rhandler))
 				ret = tcmur_cmd_passthrough_handler(dev, cmd);
@@ -627,7 +649,7 @@ static void *tcmur_cmdproc_thread(void *arg)
 				ret = tcmur_generic_handle_cmd(dev, cmd);
 
 			if (ret == TCMU_STS_NOT_HANDLED)
-				tcmu_print_cdb_info(dev, cmd, "is not supported");
+				tcmu_cdb_print_info(dev, cmd, "is not supported");
 
 			/*
 			 * command (processing) completion is called in the following
@@ -645,7 +667,7 @@ static void *tcmur_cmdproc_thread(void *arg)
 		if (completed)
 			tcmulib_processing_complete(dev);
 
-		pfd.fd = tcmu_get_dev_fd(dev);
+		pfd.fd = tcmu_dev_get_fd(dev);
 		pfd.events = POLLIN;
 		pfd.revents = 0;
 
@@ -691,7 +713,7 @@ static int dev_resize(struct tcmu_device *dev, struct tcmulib_cfg_info *cfg)
 	struct tcmur_handler *rhandler = tcmu_get_runner_handler(dev);
 	int ret;
 
-	if (tcmu_get_dev_num_lbas(dev) * tcmu_get_dev_block_size(dev) ==
+	if (tcmu_dev_get_num_lbas(dev) * tcmu_dev_get_block_size(dev) ==
 	    cfg->data.dev_size)
 		return 0;
 
@@ -699,11 +721,10 @@ static int dev_resize(struct tcmu_device *dev, struct tcmulib_cfg_info *cfg)
 	if (ret)
 		return ret;
 
-	ret = tcmu_update_num_lbas(dev, cfg->data.dev_size);
-	if (!ret)
-		tcmur_set_pending_ua(dev, TCMUR_UA_DEV_SIZE_CHANGED);
-
-	return ret;
+	tcmu_dev_set_num_lbas(dev, cfg->data.dev_size /
+			      tcmu_dev_get_block_size(dev));
+	tcmur_set_pending_ua(dev, TCMUR_UA_DEV_SIZE_CHANGED);
+	return 0;
 }
 
 static int dev_reconfig(struct tcmu_device *dev, struct tcmulib_cfg_info *cfg)
@@ -727,55 +748,80 @@ static int dev_added(struct tcmu_device *dev)
 	struct list_head group_list;
 	struct tcmur_device *rdev;
 	int32_t block_size, max_sectors;
-	uint32_t max_xfer_length;
 	int64_t dev_size;
 	int ret;
 
 	rdev = calloc(1, sizeof(*rdev));
 	if (!rdev)
 		return -ENOMEM;
-	tcmu_set_daemon_dev_private(dev, rdev);
+
+	tcmu_dev_set_private(dev, rdev);
 	list_node_init(&rdev->recovery_entry);
 	rdev->dev = dev;
 
 	ret = -EINVAL;
-	block_size = tcmu_get_attribute(dev, "hw_block_size");
+	block_size = tcmu_cfgfs_dev_get_attr_int(dev, "hw_block_size");
 	if (block_size <= 0) {
 		tcmu_dev_err(dev, "Could not get hw_block_size\n");
 		goto free_rdev;
 	}
-	tcmu_set_dev_block_size(dev, block_size);
+	tcmu_dev_set_block_size(dev, block_size);
 
-	dev_size = tcmu_get_dev_size(dev);
-	if (dev_size < 0) {
+	dev_size = tcmu_cfgfs_dev_get_info_u64(dev, "Size", &ret);
+	if (ret < 0) {
 		tcmu_dev_err(dev, "Could not get device size\n");
 		goto free_rdev;
 	}
-	tcmu_set_dev_num_lbas(dev, dev_size / block_size);
+	tcmu_dev_set_num_lbas(dev, dev_size / block_size);
 
-	max_sectors = tcmu_get_attribute(dev, "hw_max_sectors");
+	max_sectors = tcmu_cfgfs_dev_get_attr_int(dev, "hw_max_sectors");
 	if (max_sectors < 0)
 		goto free_rdev;
-	tcmu_set_dev_max_xfer_len(dev, max_sectors);
+	tcmu_dev_set_max_xfer_len(dev, max_sectors);
 
-	tcmu_dev_dbg(dev, "Got block_size %ld, size in bytes %lld\n",
+	/*
+	 * Set the optimal unmap granularity to max xfer len. Optimal unmap
+	 * alignment starts at the begining of the device. Handlers can
+	 * override in their open function.
+	 */
+	tcmu_dev_set_max_unmap_len(dev, VPD_MAX_UNMAP_LBA_COUNT);
+	tcmu_dev_set_opt_unmap_gran(dev, max_sectors, true);
+	tcmu_dev_set_unmap_gran_align(dev, 0);
+	/*
+	 * By default we will try to do RWs for xcopys in max_sector chunks,
+	 * but handlers that can do larger internal IOs should override.
+	 */
+	tcmu_dev_set_opt_xcopy_rw_len(dev, max_sectors);
+
+	if (rhandler->unmap)
+		tcmu_dev_set_unmap_enabled(dev, true);
+
+	tcmu_dev_dbg(dev, "Got block_size %d, size in bytes %"PRId64"\n",
 		     block_size, dev_size);
 
 	ret = pthread_spin_init(&rdev->lock, 0);
-	if (ret != 0)
+	if (ret) {
+		ret = -ret;
 		goto free_rdev;
+	}
 
 	ret = pthread_mutex_init(&rdev->caw_lock, NULL);
-	if (ret != 0)
+	if (ret) {
+		ret = -ret;
 		goto cleanup_dev_lock;
+	}
 
 	ret = pthread_mutex_init(&rdev->format_lock, NULL);
-	if (ret != 0)
+	if (ret) {
+		ret = -ret;
 		goto cleanup_caw_lock;
+	}
 
 	ret = pthread_mutex_init(&rdev->state_lock, NULL);
-	if (ret != 0)
+	if (ret) {
+		ret = -ret;
 		goto cleanup_format_lock;
+	}
 
 	ret = setup_io_work_queue(dev);
 	if (ret < 0)
@@ -799,21 +845,17 @@ static int dev_added(struct tcmu_device *dev)
 	rdev->flags |= TCMUR_DEV_FLAG_IS_OPEN;
 
 	ret = pthread_cond_init(&rdev->lock_cond, NULL);
-	if (ret < 0)
+	if (ret) {
+		ret = -ret;
 		goto close_dev;
-
-	/*
-	 * Set the optimal unmap granularity to max xfer len. Optimal unmap
-	 * alignment starts at the begining of the device.
-	 */
-	max_xfer_length = tcmu_get_dev_max_xfer_len(dev);
-	tcmu_set_dev_opt_unmap_gran(dev, max_xfer_length);
-	tcmu_set_dev_unmap_gran_align(dev, 0);
+	}
 
 	ret = pthread_create(&rdev->cmdproc_thread, NULL, tcmur_cmdproc_thread,
 			     dev);
-	if (ret < 0)
+	if (ret) {
+		ret = -ret;
 		goto cleanup_lock_cond;
+	}
 
 	return 0;
 
@@ -840,7 +882,7 @@ free_rdev:
 
 static void dev_removed(struct tcmu_device *dev)
 {
-	struct tcmur_device *rdev = tcmu_get_daemon_dev_private(dev);
+	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
 	int ret;
 
 	pthread_mutex_lock(&rdev->state_lock);
@@ -859,7 +901,7 @@ static void dev_removed(struct tcmu_device *dev)
 	if (aio_wait_for_empty_queue(rdev))
 		tcmu_dev_err(dev, "could not flush queue.\n");
 
-	tcmu_cancel_thread(rdev->cmdproc_thread);
+	tcmu_thread_cancel(rdev->cmdproc_thread);
 	tcmur_stop_device(dev);
 
 	cleanup_io_work_queue(dev, false);
@@ -967,10 +1009,18 @@ int main(int argc, char **argv)
 	GMainLoop *loop;
 	GIOChannel *libtcmu_gio;
 	guint reg_id;
+	guint watch_id;
+	bool reset_nl_supp = false;
 	bool new_path = false;
+	bool watching_cfg = false;
 	struct flock lock_fd = {0, };
 	int fd;
-	int ret;
+	int ret = -1;
+
+	if ((tcmu_cfg = tcmu_initialize_config()) == NULL) {
+		tcmu_err("initializing the tcmu config failed: %m\n");
+		exit(EXIT_FAILURE);
+	}
 
 	while (1) {
 		int option_index = 0;
@@ -989,8 +1039,7 @@ int main(int argc, char **argv)
 			}
 			break;
 		case 'l':
-			if (!tcmu_logdir_create(optarg, false))
-				goto free_opt;
+			snprintf(tcmu_cfg->def_log_dir, PATH_MAX, "%s", optarg);
 			break;
 		case 'f':
 			nr_files = atol(optarg);
@@ -998,45 +1047,44 @@ int main(int argc, char **argv)
 				tcmu_err("--nofile=%d should be in [%lu, %lu]\n", nr_files,
 					(unsigned long)TCMUR_MIN_OPEN_FD,
 					(unsigned long)TCMUR_MAX_OPEN_FD);
-				goto free_opt;
+				goto free_config;
 			}
 
-			ret = tcmu_set_max_fd_limit(nr_files);
-			if (ret)
-				goto free_opt;
+			if (tcmu_set_max_fd_limit(nr_files))
+				goto free_config;
 			break;
 		case 'd':
-			tcmu_set_log_level(TCMU_CONF_LOG_DEBUG_SCSI_CMD);
+			tcmu_cfg->def_log_level = TCMU_CONF_LOG_DEBUG_SCSI_CMD;
 			break;
 		case 'V':
 			tcmu_info("tcmu-runner %s\n", TCMUR_VERSION);
-			goto free_opt;
+			goto free_config;
 		default:
 		case 'h':
 			usage();
-			goto free_opt;
+			goto free_config;
 		}
 	}
-
-	if (!tcmu_logdir_getenv())
-		goto free_opt;
 
 	/*
 	 * The order of setting up config and logger is important, because
 	 * the log directory may be configured via the system config file
 	 * which will be used in logger setting up.
 	 */
-	tcmu_cfg = tcmu_setup_config(NULL);
-	if (!tcmu_cfg)
-		goto free_opt;
+	if (tcmu_load_config(tcmu_cfg)) {
+		tcmu_err("Loading TCMU config failed!\n");
+		goto free_config;
+	}
 
-	if (tcmu_setup_log())
-		goto destroy_config;
+	if (tcmu_setup_log(tcmu_cfg->log_dir))
+		goto free_config;
+
+	tcmu_crit("Starting...\n");
 
 	fd = creat(TCMU_LOCK_FILE, S_IRUSR | S_IWUSR);
 	if (fd == -1) {
 		tcmu_err("creat(%s) failed: [%m]\n", TCMU_LOCK_FILE);
-		goto destroy_log;
+		goto free_config;
 	}
 
 	lock_fd.l_type = F_WRLCK;
@@ -1050,16 +1098,32 @@ int main(int argc, char **argv)
 		goto close_fd;
 	}
 
-	ret = load_our_module();
-	if (ret < 0) {
+	if (load_our_module() < 0) {
 		tcmu_err("couldn't load module\n");
 		goto close_fd;
 	}
 
 	tcmu_dbg("handler path: %s\n", handler_path);
 
-	tcmu_block_netlink();
-	tcmu_reset_netlink();
+	/*
+	 * If this is a restart we need to prevent new nl cmds from being
+	 * sent to us until we have everything ready.
+	 */
+	tcmu_dbg("blocking netlink\n");
+	reset_nl_supp = true;
+	ret = tcmu_cfgfs_mod_param_set_u32("block_netlink", 1);
+	tcmu_dbg("blocking netlink done\n");
+	if (ret == -ENOENT) {
+		reset_nl_supp = false;
+	} else {
+		/*
+		 * If it exists ignore errors and try to reset in case kernel is
+		 * in an invalid state
+		 */
+		tcmu_dbg("reseting netlink\n");
+		tcmu_cfgfs_mod_param_set_u32("reset_netlink", 1);
+		tcmu_dbg("reset netlink done\n");
+	}
 
 	ret = open_handlers();
 	if (ret < 0) {
@@ -1067,6 +1131,7 @@ int main(int argc, char **argv)
 		goto close_fd;
 	}
 	tcmu_dbg("%d runner handlers found\n", ret);
+	ret = -1;
 
 	/*
 	 * Convert from tcmu-runner's handler struct to libtcmu's
@@ -1080,6 +1145,7 @@ int main(int argc, char **argv)
 		tmp_handler.subtype = (*tmp_r_handler)->subtype;
 		tmp_handler.cfg_desc = (*tmp_r_handler)->cfg_desc;
 		tmp_handler.check_config = (*tmp_r_handler)->check_config;
+		tmp_handler.update_logdir = (*tmp_r_handler)->update_logdir;
 		tmp_handler.reconfig = dev_reconfig;
 		tmp_handler.added = dev_added;
 		tmp_handler.removed = dev_removed;
@@ -1100,18 +1166,24 @@ int main(int argc, char **argv)
 		goto err_free_handlers;
 	}
 
-	loop = g_main_loop_new(NULL, FALSE);
-	if (g_unix_signal_add(SIGINT, sighandler, loop) <= 0 ||
-	    g_unix_signal_add(SIGTERM, sighandler, loop) <= 0) {
-		tcmu_err("couldn't setup signal handlers\n");
-		goto err_tcmulib_close;
+	tcmu_cfg->ctx = tcmulib_context;
+	if (tcmu_watch_config(tcmu_cfg)) {
+		tcmu_warn("Dynamic config file changes is not supported.\n");
+	} else {
+		watching_cfg = true;
 	}
 
-	darray_free(handlers);
+	loop = g_main_loop_new(NULL, FALSE);
+	if (g_unix_signal_add(SIGINT, handle_sig, loop) <= 0 ||
+	    g_unix_signal_add(SIGTERM, handle_sig, loop) <= 0 ||
+	    g_unix_signal_add(SIGHUP, handle_sighup, loop) <= 0) {
+		tcmu_err("couldn't setup signal handlers\n");
+		goto unwatch_cfg;
+	}
 
 	/* Set up event for libtcmu */
 	libtcmu_gio = g_io_channel_unix_new(tcmulib_get_master_fd(tcmulib_context));
-	g_io_add_watch(libtcmu_gio, G_IO_IN, tcmulib_callback, tcmulib_context);
+	watch_id = g_io_add_watch(libtcmu_gio, G_IO_IN, tcmulib_callback, tcmulib_context);
 
 	/* Set up DBus name, see callback */
 	reg_id = g_bus_own_name(G_BUS_TYPE_SYSTEM,
@@ -1124,48 +1196,47 @@ int main(int argc, char **argv)
 				NULL  // user date free func
 		);
 
-	tcmu_unblock_netlink();
+	if (reset_nl_supp) {
+		tcmu_cfgfs_mod_param_set_u32("block_netlink", 0);
+		reset_nl_supp = false;
+	}
 	g_main_loop_run(loop);
 
-	tcmu_info("Exiting...\n");
+	tcmu_crit("Exiting...\n");
 	g_bus_unown_name(reg_id);
 	g_main_loop_unref(loop);
+	g_source_remove(watch_id);
 	g_io_channel_shutdown(libtcmu_gio, TRUE, NULL);
+	g_io_channel_unref (libtcmu_gio);
 	g_object_unref(manager);
-	tcmulib_close(tcmulib_context);
 
-	lock_fd.l_type = F_UNLCK;
-	if (fcntl(fd, F_SETLK, &lock_fd) == -1) {
-		tcmu_err("fcntl(UNLCK) on lockfile %s failed: [%m]\n",
-		         TCMU_LOCK_FILE);
-	}
-	close(fd);
+	ret = 0;
 
-	tcmu_destroy_config(tcmu_cfg);
-	tcmu_destroy_log();
-
-	return 0;
-
-err_tcmulib_close:
+unwatch_cfg:
+	if (watching_cfg)
+		tcmu_unwatch_config(tcmu_cfg);
 	tcmulib_close(tcmulib_context);
 err_free_handlers:
 	darray_free(handlers);
 close_fd:
-	tcmu_unblock_netlink();
+	if (reset_nl_supp)
+		tcmu_cfgfs_mod_param_set_u32("block_netlink", 0);
+
 	lock_fd.l_type = F_UNLCK;
 	if (fcntl(fd, F_SETLK, &lock_fd) == -1) {
 		tcmu_err("fcntl(UNLCK) on lockfile %s failed: [%m]\n",
 		         TCMU_LOCK_FILE);
 	}
 	close(fd);
-destroy_log:
+
 	tcmu_destroy_log();
-destroy_config:
-	tcmu_destroy_config(tcmu_cfg);
-free_opt:
+free_config:
+	tcmu_free_config(tcmu_cfg);
 	if (new_path)
 		free(handler_path);
-	tcmu_logdir_destroy();
 
-	exit(1);
+	if (ret)
+		exit(EXIT_FAILURE);
+
+	return 0;
 }

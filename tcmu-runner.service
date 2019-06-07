@@ -1,6 +1,7 @@
 [Unit]
 Description=LIO Userspace-passthrough daemon
-After=network.target
+Wants=rsyslog.service
+After=network.target rsyslog.service
 
 [Service]
 LimitNOFILE=1000000
@@ -8,6 +9,7 @@ Type=dbus
 BusName=org.kernel.TCMUService1
 KillMode=process
 ExecStart=/usr/bin/tcmu-runner
+Restart=always
 
 [Install]
 WantedBy=multi-user.target

@@ -64,6 +64,8 @@ struct tcmulib_handler {
 
 	int (*reconfig)(struct tcmu_device *dev, struct tcmulib_cfg_info *cfg);
 
+	bool (*update_logdir)(void);
+
 	/* Per-device added/removed callbacks */
 	int (*added)(struct tcmu_device *dev);
 	void (*removed)(struct tcmu_device *dev);
@@ -111,7 +113,8 @@ struct tcmulib_cmd *tcmulib_get_next_command(struct tcmu_device *dev);
  * Mark the command as complete.
  * Must be called before get_next_command() is called again.
  *
- * result is scsi status, or TCMU_STS_NOT_HANDLED or TCMU_ASYNC_HANDLED.
+ * result is TCMU_STS value from libtcmu_common.h. If TCMU_STS_PASSTHROUGH_ERR
+ * is returned then the caller must setup the tcmulib_cmd->sense_buf.
  */
 void tcmulib_command_complete(struct tcmu_device *dev, struct tcmulib_cmd *cmd, int result);
 
