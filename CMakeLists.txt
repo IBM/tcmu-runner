@@ -1,6 +1,6 @@
 cmake_minimum_required (VERSION 2.8 FATAL_ERROR)
 project (tcmu-runner C)
-set(VERSION 1.4.0)
+set(VERSION 1.5.2)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Werror -Wall -Wdeclaration-after-statement -std=c99")
 
 include(GNUInstallDirs)
@@ -38,6 +38,7 @@ find_library(DL dl)
 
 if (with-tcmalloc)
   find_library(TCMALLOC_LIB tcmalloc)
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free")
 endif(with-tcmalloc)
 
 # Stuff for building the shared library
@@ -55,6 +56,7 @@ add_library(tcmu
   )
 set_target_properties(tcmu
   PROPERTIES
+  VERSION 2.2
   SOVERSION "2"
   )
 target_include_directories(tcmu
@@ -66,6 +68,7 @@ target_link_libraries(tcmu
   ${LIBNL_LIB}
   ${LIBNL_GENL_LIB}
   ${GLIB_LIBRARIES}
+  ${TCMALLOC_LIB}
   )
 install(TARGETS tcmu LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
@@ -88,6 +91,7 @@ target_include_directories(tcmu_static
   )
 target_link_libraries(tcmu_static
   ${GLIB_LIBRARIES}
+  ${TCMALLOC_LIB}
   )
 
 # Stuff for building the main binary
@@ -131,6 +135,7 @@ target_include_directories(tcmu-synthesizer
   )
 target_link_libraries(tcmu-synthesizer
   ${GLIB_LIBRARIES}
+  ${TCMALLOC_LIB}
   )
 
 install(TARGETS RUNTIME DESTINATION bin)
@@ -178,7 +183,7 @@ if (with-fbo)
 	target_include_directories(handler_file_optical
   	PUBLIC ${PROJECT_SOURCE_DIR}/ccan
   	)
-	target_link_libraries(handler_file_optical ${PTHREAD})
+	target_link_libraries(handler_file_optical ${PTHREAD} ${TCMALLOC_LIB})
 	install(TARGETS handler_file_optical DESTINATION ${CMAKE_INSTALL_LIBDIR}/tcmu-runner)
 endif (with-fbo)
 
@@ -203,6 +208,7 @@ if (with-zbc)
 	target_include_directories(handler_file_zbc
 	  PUBLIC ${PROJECT_SOURCE_DIR}/ccan
 	  )
+	target_link_libraries(handler_file_zbc ${TCMALLOC_LIB})
 	install(TARGETS handler_file_zbc DESTINATION ${CMAKE_INSTALL_LIBDIR}/tcmu-runner)
 endif (with-zbc)
 
@@ -223,6 +229,7 @@ if (with-rbd)
 	  )
 	target_link_libraries(handler_rbd
 	  ${LIBRBD}
+	  ${TCMALLOC_LIB}
 	  )
 	install(TARGETS handler_rbd DESTINATION ${CMAKE_INSTALL_LIBDIR}/tcmu-runner)
 endif (with-rbd)
@@ -251,6 +258,7 @@ if (with-glfs)
 	  )
 	target_link_libraries(handler_glfs
 	  ${GFAPI}
+	  ${TCMALLOC_LIB}
 	  )
 	install(TARGETS handler_glfs DESTINATION ${CMAKE_INSTALL_LIBDIR}/tcmu-runner)
 endif (with-glfs)
@@ -280,6 +288,7 @@ if (with-qcow)
 	endif (HAVE_LINUX_FALLOC)
 	target_link_libraries(handler_qcow
 	  ${ZLIB_LIBRARIES}
+	  ${TCMALLOC_LIB}
 	  )
 	install(TARGETS handler_qcow DESTINATION ${CMAKE_INSTALL_LIBDIR}/tcmu-runner)
 endif (with-qcow)
@@ -303,8 +312,6 @@ configure_file (
   )
 install(SCRIPT logrotate.conf_install.cmake)
 
-install(FILES libtcmu.h libtcmu_common.h
-  DESTINATION include)
 install(FILES org.kernel.TCMUService1.service
   DESTINATION /usr/share/dbus-1/system-services)
 install(FILES tcmu-runner.conf DESTINATION /etc/dbus-1/system.d)

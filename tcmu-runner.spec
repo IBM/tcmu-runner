@@ -35,7 +35,7 @@ Name:          tcmu-runner
 Summary:       A daemon that handles the userspace side of the LIO TCM-User backstore
 Group:         System Environment/Daemons
 License:       ASL 2.0 or LGPLv2+
-Version:       1.4.0
+Version:       1.5.2
 URL:           https://github.com/open-iscsi/tcmu-runner
 
 #%define _RC
@@ -149,6 +149,4 @@ Development header(s) for developing against libtcmu.
 %{_libdir}/libtcmu*.so.*
 
 %files -n libtcmu-devel
-%{_includedir}/libtcmu.h
-%{_includedir}/libtcmu_common.h
 %{_libdir}/libtcmu*.so
