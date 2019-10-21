@@ -24,7 +24,7 @@ fi
 #VERSION=`git describe --tags --match "v[0-9]*"`
 #VERSION=`echo $VERSION | sed "s/-/./g"`
 #VERSION=`echo $VERSION | sed "s/v//"`
-VERSION="1.4.2.1"
+VERSION="1.5.2.1"
 TCMURUNNER_TAR=tcmu-runner-$VERSION.tar.gz
 rpmbuild_path=`pwd`/rpmbuild
 
