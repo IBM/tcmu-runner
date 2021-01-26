@@ -48,6 +48,7 @@
 #include "version.h"
 #include "libtcmu_config.h"
 #include "libtcmu_log.h"
+#include "tcmur_work.h"
 
 #define TCMU_LOCK_FILE   "/run/tcmu.lock"
 
@@ -67,6 +68,7 @@ struct tcmur_handler *tcmu_get_runner_handler(struct tcmu_device *dev)
 int tcmur_register_handler(struct tcmur_handler *handler)
 {
 	struct tcmur_handler *h;
+	int ret;
 	int i;
 
 	for (i = 0; i < darray_size(g_runner_handlers); i++) {
@@ -78,6 +80,16 @@ int tcmur_register_handler(struct tcmur_handler *handler)
 		}
 	}
 
+	if (handler->init) {
+		ret = handler->init();
+		if (ret) {
+			tcmu_err("Failed to init handler %s, ret = %d\n",
+				 handler->subtype, ret);
+			return ret;
+		}
+	}
+
+	tcmu_info("Handler %s is registered\n", handler->subtype);
 	darray_append(g_runner_handlers, handler);
 	return 0;
 }
@@ -105,6 +117,8 @@ static void free_dbus_handler(struct tcmur_handler *handler)
 	g_free((char*)handler->opaque);
 	g_free((char*)handler->subtype);
 	g_free((char*)handler->cfg_desc);
+	if (handler->destroy)
+		handler->destroy();
 	g_free(handler);
 }
 
@@ -120,6 +134,20 @@ static bool tcmur_unregister_dbus_handler(struct tcmur_handler *handler)
 	}
 
 	return ret;
+}
+
+static void tcmur_unregister_all_dbus_handlers(void)
+{
+	struct tcmur_handler *handler;
+	int i;
+	for (i = 0; i < darray_size(g_runner_handlers); i++) {
+		handler = darray_item(g_runner_handlers, i);
+		if (handler->_is_dbus_handler == true) {
+			if (tcmur_unregister_handler(handler))
+				free_dbus_handler(handler);
+		}
+	}
+	darray_free(g_runner_handlers);
 }
 
 static int is_handler(const struct dirent *dirent)
@@ -600,7 +628,7 @@ static void tcmur_stop_device(void *arg)
 	 * The lock thread can fire off the recovery thread, so make sure
 	 * it is done first.
 	 */
-	tcmu_cancel_lock_thread(dev);
+	tcmur_flush_work(rdev->event_work);
 	tcmu_cancel_recovery(dev);
 
 	tcmu_release_dev_lock(dev);
@@ -723,6 +751,12 @@ static void check_for_timed_out_cmds(struct tcmu_device *dev)
 		}
 
 		tcmur_cmd->timed_out = true;
+		/*
+		 * These time outs are only currently used for diagnostic
+		 * purposes right now, so we do not want to escalate the
+		 * error handler and just return true here.
+		 */
+	       tcmu_notify_cmd_timed_out(dev);
 	}
 	pthread_spin_unlock(&rdev->lock);
 }
@@ -755,6 +789,8 @@ static void *tcmur_cmdproc_thread(void *arg)
 	struct pollfd pfd;
 	int ret;
 	bool dev_stopping = false;
+
+	tcmu_set_thread_name("cmdproc", dev);
 
 	pthread_cleanup_push(tcmur_stop_device, dev);
 
@@ -1029,9 +1065,9 @@ static int dev_added(struct tcmu_device *dev)
 
 	rdev->flags |= TCMUR_DEV_FLAG_IS_OPEN;
 
-	ret = pthread_cond_init(&rdev->lock_cond, NULL);
-	if (ret) {
-		ret = -ret;
+	rdev->event_work = tcmur_create_work();
+	if (!rdev->event_work) {
+		ret = -ENOMEM;
 		goto close_dev;
 	}
 
@@ -1039,13 +1075,13 @@ static int dev_added(struct tcmu_device *dev)
 			     dev);
 	if (ret) {
 		ret = -ret;
-		goto cleanup_lock_cond;
+		goto cleanup_event_work;
 	}
 
 	return 0;
 
-cleanup_lock_cond:
-	pthread_cond_destroy(&rdev->lock_cond);
+cleanup_event_work:
+	tcmur_destroy_work(rdev->event_work);
 close_dev:
 	rhandler->close(dev);
 cleanup_aio_tracking:
@@ -1092,9 +1128,7 @@ static void dev_removed(struct tcmu_device *dev)
 	cleanup_io_work_queue(dev, false);
 	cleanup_aio_tracking(rdev);
 
-	ret = pthread_cond_destroy(&rdev->lock_cond);
-	if (ret != 0)
-		tcmu_err("could not cleanup lock cond %d\n", ret);
+	tcmur_destroy_work(rdev->event_work);
 
 	ret = pthread_mutex_destroy(&rdev->state_lock);
 	if (ret != 0)
@@ -1190,7 +1224,8 @@ int main(int argc, char **argv)
 {
 	darray(struct tcmulib_handler) handlers = darray_new();
 	struct tcmulib_context *tcmulib_context;
-	struct tcmur_handler **tmp_r_handler;
+	struct tcmur_handler **tmp_r_handler, *r_handler;
+	struct tcmulib_handler *handler;
 	GMainLoop *loop;
 	GIOChannel *libtcmu_gio;
 	guint reg_id;
@@ -1402,6 +1437,13 @@ unwatch_cfg:
 		tcmu_unwatch_config(tcmu_cfg);
 	tcmulib_close(tcmulib_context);
 err_free_handlers:
+	tcmur_unregister_all_dbus_handlers();
+
+	darray_foreach(handler, handlers) {
+		r_handler = handler->hm_private;
+		if (r_handler && r_handler->destroy)
+			r_handler->destroy();
+	}
 	darray_free(handlers);
 close_fd:
 	if (reset_nl_supp)

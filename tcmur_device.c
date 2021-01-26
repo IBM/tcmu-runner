@@ -20,6 +20,7 @@
 #include "tcmu-runner.h"
 #include "tcmur_device.h"
 #include "tcmur_cmd_handler.h"
+#include "tcmur_work.h"
 #include "tcmu_runner_priv.h"
 #include "target.h"
 
@@ -44,17 +45,12 @@ int __tcmu_reopen_dev(struct tcmu_device *dev, int retries)
 	struct tcmur_handler *rhandler = tcmu_get_runner_handler(dev);
 	int ret, attempt = 0;
 	bool needs_close = false;
-	bool cancel_lock = false;
 
 	pthread_mutex_lock(&rdev->state_lock);
 	if (rdev->flags & TCMUR_DEV_FLAG_STOPPING) {
 		ret = 0;
 		goto done;
 	}
-
-	if (rdev->lock_state == TCMUR_DEV_LOCK_LOCKING &&
-	    pthread_self() != rdev->lock_thread)
-		cancel_lock = true;
 	pthread_mutex_unlock(&rdev->state_lock);
 
 	/*
@@ -62,18 +58,9 @@ int __tcmu_reopen_dev(struct tcmu_device *dev, int retries)
 	 * async lock requests in progress that might be accessing
 	 * the device.
 	 */
-	if (cancel_lock)
-		tcmu_cancel_lock_thread(dev);
+	tcmur_flush_work(rdev->event_work);
 
-	/*
-	 * Force a reacquisition of the lock when we have reopend the
-	 * device, so it can update state. If we are being called from
-	 * the lock code path then do not change state.
-	 */
 	pthread_mutex_lock(&rdev->state_lock);
-	if (rdev->lock_state != TCMUR_DEV_LOCK_LOCKING)
-		rdev->lock_state = TCMUR_DEV_LOCK_UNLOCKED;
-
 	if (rdev->flags & TCMUR_DEV_FLAG_IS_OPEN)
 		needs_close = true;
 	rdev->flags &= ~TCMUR_DEV_FLAG_IS_OPEN;
@@ -167,20 +154,46 @@ void tcmu_cancel_recovery(struct tcmu_device *dev)
 	tcmu_dev_dbg(dev, "Recovery thread wait done\n");
 }
 
-/**
- * tcmu_notify_conn_lost - notify runner the device instace has lost its
- *			   connection to its backend storage.
- * @dev: device that has lost its connection
- *
- * Handlers should call this function when they detect they cannot reach their
- * backend storage/medium/cache, so new commands will not be queued until
- * the device has been reopened.
- */
-void tcmu_notify_conn_lost(struct tcmu_device *dev)
+static void __tcmu_report_event(void *data)
 {
+	struct tcmu_device *dev = data;
 	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
+	struct tcmur_handler *rhandler = tcmu_get_runner_handler(dev);
+	int ret;
+
+	/*
+	 * For cmd timeouts and unbalanced systems we will get a burst so wait
+	 * a second to batch up the updates.
+	 */
+	sleep(1);
 
 	pthread_mutex_lock(&rdev->state_lock);
+	ret = rhandler->report_event(dev);
+	if (ret)
+		tcmu_dev_err(dev, "Could not report events. Error %d.\n", ret);
+	pthread_mutex_unlock(&rdev->state_lock);
+}
+
+static void tcmu_report_event(struct tcmu_device *dev)
+{
+	struct tcmur_handler *rhandler = tcmu_get_runner_handler(dev);
+	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
+	int ret;
+
+	if (!rhandler->report_event)
+		return;
+
+	ret = tcmur_run_work(rdev->event_work, dev, __tcmu_report_event);
+	if (!ret)
+		return;
+
+	if (ret != -EBUSY)
+		tcmu_dev_err(dev, "Could not execute event work. Error %d", ret);
+}
+
+static bool __tcmu_notify_conn_lost(struct tcmu_device *dev)
+{
+	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
 
 	/*
 	 * Although there are 2 checks for STOPPING in __tcmu_reopen_dev
@@ -195,15 +208,51 @@ void tcmu_notify_conn_lost(struct tcmu_device *dev)
 	 */
 	if ((rdev->flags & TCMUR_DEV_FLAG_STOPPING) ||
 		(rdev->flags & TCMUR_DEV_FLAG_IN_RECOVERY))
-		goto unlock;
+		return false;
 
 	tcmu_dev_err(dev, "Handler connection lost (lock state %d)\n",
 		     rdev->lock_state);
 
-	if (!tcmu_add_dev_to_recovery_list(dev))
+	if (!tcmu_add_dev_to_recovery_list(dev)) {
 		rdev->flags |= TCMUR_DEV_FLAG_IN_RECOVERY;
-unlock:
+		rdev->conn_lost_cnt++;
+		return true;
+	}
+
+	return false;
+}
+
+/**
+ * tcmu_notify_conn_lost - notify runner the device instace has lost its
+ *			   connection to its backend storage.
+ * @dev: device that has lost its connection
+ *
+ * Handlers should call this function when they detect they cannot reach their
+ * backend storage/medium/cache, so new commands will not be queued until
+ * the device has been reopened.
+ */
+void tcmu_notify_conn_lost(struct tcmu_device *dev)
+{
+	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
+	bool report;
+
+	pthread_mutex_lock(&rdev->state_lock);
+	report =__tcmu_notify_conn_lost(dev);
 	pthread_mutex_unlock(&rdev->state_lock);
+
+	if (report)
+		tcmu_report_event(dev);
+}
+
+static void __tcmu_notify_lock_lost(struct tcmu_device *dev)
+{
+	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
+
+	rdev->lock_lost = true;
+	rdev->lock_state = TCMUR_DEV_LOCK_UNLOCKED;
+	rdev->lock_lost_cnt++;
+
+	tcmu_report_event(dev);
 }
 
 /**
@@ -224,32 +273,10 @@ void tcmu_notify_lock_lost(struct tcmu_device *dev)
 	 * We could be getting stale IO completions. If we are trying to
 	 * reaquire the lock do not change state.
 	 */
-	if (rdev->lock_state != TCMUR_DEV_LOCK_LOCKING) {
-		rdev->lock_lost = true;
-		rdev->lock_state = TCMUR_DEV_LOCK_UNLOCKED;
+	if (rdev->lock_state != TCMUR_DEV_LOCK_WRITE_LOCKING) {
+		__tcmu_notify_lock_lost(dev);
 	}
 	pthread_mutex_unlock(&rdev->state_lock);
-}
-
-int tcmu_cancel_lock_thread(struct tcmu_device *dev)
-{
-	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
-	int ret;
-
-	pthread_mutex_lock(&rdev->state_lock);
-	if (rdev->lock_state != TCMUR_DEV_LOCK_LOCKING) {
-		pthread_mutex_unlock(&rdev->state_lock);
-		return 0;
-	}
-	/*
-	 * It looks like lock calls are not cancelable, so
-	 * we wait here to avoid crashes.
-	 */
-	tcmu_dev_dbg(rdev->dev, "waiting for lock thread to exit\n");
-	ret = pthread_cond_wait(&rdev->lock_cond, &rdev->state_lock);
-	pthread_mutex_unlock(&rdev->state_lock);
-
-	return ret;
 }
 
 void tcmu_release_dev_lock(struct tcmu_device *dev)
@@ -259,7 +286,7 @@ void tcmu_release_dev_lock(struct tcmu_device *dev)
 	int ret;
 
 	pthread_mutex_lock(&rdev->state_lock);
-	if (rdev->lock_state != TCMUR_DEV_LOCK_LOCKED) {
+	if (rdev->lock_state != TCMUR_DEV_LOCK_WRITE_LOCKED) {
 		pthread_mutex_unlock(&rdev->state_lock);
 		return;
 	}
@@ -376,11 +403,21 @@ int tcmu_acquire_dev_lock(struct tcmu_device *dev, uint16_t tag)
 		goto done;
 	}
 
+	/*
+	 * Since we are here the lock state must be one of:
+	 * for implicit:
+	 *    TCMUR_DEV_LOCK_READ_LOCKING
+	 *    TCMUR_DEV_LOCK_WRITE_LOCKING
+	 *
+	 * for explicit:
+	 *    TCMUR_DEV_LOCK_UNLOCKED
+	 *    TCMUR_DEV_LOCK_UNKNOWN
+	 */
+
 	reopen = false;
 	pthread_mutex_lock(&rdev->state_lock);
-	if (rdev->lock_lost || !(rdev->flags & TCMUR_DEV_FLAG_IS_OPEN)) {
+	if (rdev->lock_lost || !(rdev->flags & TCMUR_DEV_FLAG_IS_OPEN))
 		reopen = true;
-	}
 	pthread_mutex_unlock(&rdev->state_lock);
 
 retry:
@@ -398,6 +435,14 @@ retry:
 			goto drop_conn;
 		}
 	}
+
+	pthread_mutex_lock(&rdev->state_lock);
+	if (rdev->lock_state == TCMUR_DEV_LOCK_READ_LOCKING) {
+		pthread_mutex_unlock(&rdev->state_lock);
+		ret = TCMU_STS_OK;
+		goto done;
+	}
+	pthread_mutex_unlock(&rdev->state_lock);
 
 	ret = rhandler->lock(dev, tag);
 	if (ret == TCMU_STS_FENCED) {
@@ -432,15 +477,27 @@ done:
 
 	/* TODO: set UA based on bgly's patches */
 	pthread_mutex_lock(&rdev->state_lock);
-	if (ret == TCMU_STS_OK)
-		rdev->lock_state = TCMUR_DEV_LOCK_LOCKED;
-	else
+	if (ret != TCMU_STS_OK) {
 		rdev->lock_state = TCMUR_DEV_LOCK_UNLOCKED;
+		tcmu_dev_info(dev, "Lock acquisition unsuccessful\n");
+	} else {
+		if (rdev->lock_state == TCMUR_DEV_LOCK_READ_LOCKING) {
+			rdev->lock_state = TCMUR_DEV_LOCK_READ_LOCKED;
+			tcmu_dev_info(dev, "Read lock acquisition successful\n");
+		} else if (rdev->lock_state == TCMUR_DEV_LOCK_WRITE_LOCKING) {
+			rdev->lock_state = TCMUR_DEV_LOCK_WRITE_LOCKED;
+			tcmu_dev_info(dev, "Write lock acquisition successful\n");
+		} else {
+			/*
+			 * For explicit transition it will always acquire the write lock.
+			 */
+			rdev->lock_state = TCMUR_DEV_LOCK_WRITE_LOCKED;
+			tcmu_dev_info(dev, "Write lock acquisition successful\n");
+		}
+	}
 
-	tcmu_dev_dbg(dev, "lock call done. lock state %d\n", rdev->lock_state);
 	tcmu_cfgfs_dev_exec_action(dev, "block_dev", 0);
 
-	pthread_cond_signal(&rdev->lock_cond);
 	pthread_mutex_unlock(&rdev->state_lock);
 
 	return ret;
@@ -466,11 +523,10 @@ void tcmu_update_dev_lock_state(struct tcmu_device *dev)
 	state = rhandler->get_lock_state(dev);
 	pthread_mutex_lock(&rdev->state_lock);
 check_state:
-	if (rdev->lock_state == TCMUR_DEV_LOCK_LOCKED &&
-	    state != TCMUR_DEV_LOCK_LOCKED) {
+	if (rdev->lock_state == TCMUR_DEV_LOCK_WRITE_LOCKED &&
+	    state != TCMUR_DEV_LOCK_WRITE_LOCKED) {
 		tcmu_dev_dbg(dev, "Updated out of sync lock state.\n");
-		rdev->lock_state = TCMUR_DEV_LOCK_UNLOCKED;
-		rdev->lock_lost = true;
+		__tcmu_notify_lock_lost(dev);
 	}
 	pthread_mutex_unlock(&rdev->state_lock);
 }
@@ -487,4 +543,16 @@ void *tcmur_dev_get_private(struct tcmu_device *dev)
 	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
 
 	return rdev->hm_private;
+}
+
+void tcmu_notify_cmd_timed_out(struct tcmu_device *dev)
+{
+	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
+
+	pthread_mutex_lock(&rdev->state_lock);
+	rdev->cmd_timed_out_cnt++;
+	__tcmu_notify_conn_lost(dev);
+	pthread_mutex_unlock(&rdev->state_lock);
+
+	tcmu_report_event(dev);
 }

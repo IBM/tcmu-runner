@@ -32,11 +32,15 @@ enum {
 };
 
 enum {
-	TCMUR_DEV_LOCK_UNLOCKED,
-	TCMUR_DEV_LOCK_LOCKED,
-	TCMUR_DEV_LOCK_LOCKING,
 	TCMUR_DEV_LOCK_UNKNOWN,
+	TCMUR_DEV_LOCK_UNLOCKED,
+	TCMUR_DEV_LOCK_READ_LOCKING,
+	TCMUR_DEV_LOCK_READ_LOCKED,
+	TCMUR_DEV_LOCK_WRITE_LOCKING,
+	TCMUR_DEV_LOCK_WRITE_LOCKED,
 };
+
+struct tcmur_work;
 
 struct tcmur_device {
 	struct tcmu_device *dev;
@@ -48,13 +52,16 @@ struct tcmur_device {
 	uint32_t flags;
 	uint8_t failover_type;
 
-	pthread_t recovery_thread;
 	struct list_node recovery_entry;
+
+	/* tcmur_event counters */
+	uint64_t lock_lost_cnt;
+	uint64_t conn_lost_cnt;
+	uint64_t cmd_timed_out_cnt;
+	struct tcmur_work *event_work;
 
 	bool lock_lost;
 	uint8_t lock_state;
-	pthread_t lock_thread;
-	pthread_cond_t lock_cond;
 
 	/* General lock for lock state, thread, dev state, etc */
 	pthread_mutex_t state_lock;
@@ -80,10 +87,10 @@ struct tcmur_device {
 
 bool tcmu_dev_in_recovery(struct tcmu_device *dev);
 void tcmu_cancel_recovery(struct tcmu_device *dev);
-int tcmu_cancel_lock_thread(struct tcmu_device *dev);
 
 void tcmu_notify_conn_lost(struct tcmu_device *dev);
 void tcmu_notify_lock_lost(struct tcmu_device *dev);
+void tcmu_notify_cmd_timed_out(struct tcmu_device *dev);
 
 int __tcmu_reopen_dev(struct tcmu_device *dev, int retries);
 int tcmu_reopen_dev(struct tcmu_device *dev, int retries);

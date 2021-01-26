@@ -776,7 +776,7 @@ int tcmur_handle_writesame(struct tcmu_device *dev, struct tcmur_cmd *tcmur_cmd,
 	if (tcmu_dev_in_recovery(dev))
 		return TCMU_STS_BUSY;
 
-	ret = alua_check_state(dev, cmd);
+	ret = alua_check_state(dev, cmd, false);
 	if (ret)
 		return ret;
 
@@ -1161,6 +1161,12 @@ static int xcopy_parse_target_descs(struct tcmu_device *udev,
 {
 	int i, ret;
 
+	if (tdll % XCOPY_TARGET_DESC_LEN) {
+		tcmu_dev_err(udev,
+			"CSCD descriptor list length %u not a multiple of %u\n",
+			(unsigned int)tdll, XCOPY_TARGET_DESC_LEN);
+		return TCMU_STS_NOTSUPP_TGT_DESC_TYPE;
+	}
 	/* From spc4r36q,section 6.4.3.4 CSCD DESCRIPTOR LIST LENGTH field
 	 * If the number of CSCD descriptors exceeds the allowed number, the copy
 	 * manager shall terminate the command with CHECK CONDITION status, with
@@ -1173,7 +1179,7 @@ static int xcopy_parse_target_descs(struct tcmu_device *udev,
 		return TCMU_STS_TOO_MANY_TGT_DESC;
 	}
 
-	for (i = 0; i < RCR_OP_MAX_TARGET_DESC_COUNT; i++) {
+	for (i = 0; tdll >= XCOPY_TARGET_DESC_LEN; i++) {
 		/*
 		 * Only Identification Descriptor Target Descriptor support
 		 * for now.
@@ -1184,6 +1190,7 @@ static int xcopy_parse_target_descs(struct tcmu_device *udev,
 				return ret;
 
 			tgt_desc += XCOPY_TARGET_DESC_LEN;
+			tdll -= XCOPY_TARGET_DESC_LEN;
 		} else {
 			tcmu_dev_err(udev, "Unsupport target descriptor type code 0x%x\n",
 				     tgt_desc[0]);
@@ -1191,6 +1198,7 @@ static int xcopy_parse_target_descs(struct tcmu_device *udev,
 		}
 	}
 
+	ret = TCMU_STS_CP_TGT_DEV_NOTCONN;
 	if (xcopy->src_dev)
 		ret = xcopy_locate_udev(udev->ctx, xcopy->dst_tid_wwn,
 					&xcopy->dst_dev);
@@ -1308,6 +1316,12 @@ static int xcopy_parse_parameter_list(struct tcmu_device *dev,
 	 * data, after the last segment descriptor.
 	 * */
 	inline_dl = be32toh(*(uint32_t *)&par[12]);
+	if (inline_dl != 0) {
+		tcmu_dev_err(dev, "non-zero xcopy inline_dl %u unsupported\n",
+			     inline_dl);
+		ret = TCMU_STS_INVALID_PARAM_LIST_LEN;
+		goto err;
+	}
 
 	/* From spc4r31, section 6.3.1 EXTENDED COPY command introduction
 	 *
@@ -1348,6 +1362,18 @@ static int xcopy_parse_parameter_list(struct tcmu_device *dev,
 	ret = xcopy_parse_target_descs(dev, xcopy, tgt_desc, tdll);
 	if (ret != TCMU_STS_OK)
 		goto err;
+
+	/*
+	 * tcmu-runner can't determine whether the device(s) referred to in an
+	 * XCOPY request should be accessible to the initiator via transport
+	 * settings, ACLs, etc. XXX Consequently, we need to fail any
+	 * cross-device requests for safety reasons.
+	 */
+	if (dev != xcopy->src_dev || dev != xcopy->dst_dev) {
+		tcmu_dev_err(dev, "Cross-device XCOPY not supported\n");
+		ret = TCMU_STS_CP_TGT_DEV_NOTCONN;
+		goto err;
+	}
 
 	if (tcmu_dev_get_block_size(xcopy->src_dev) !=
 	    tcmu_dev_get_block_size(xcopy->dst_dev)) {
@@ -1723,7 +1749,7 @@ int tcmur_handle_caw(struct tcmu_device *dev, struct tcmur_cmd *tcmur_cmd,
 		return TCMU_STS_OK;
 	}
 
-	ret = alua_check_state(dev, cmd);
+	ret = alua_check_state(dev, cmd, false);
 	if (ret)
 		return ret;
 
@@ -2118,6 +2144,7 @@ static int tcmur_cmd_handler(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
 	struct tcmur_handler *rhandler = tcmu_get_runner_handler(dev);
 	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
 	uint8_t *cdb = cmd->cdb;
+	bool is_read = false;
 
 	track_aio_request_start(rdev);
 
@@ -2128,10 +2155,12 @@ static int tcmur_cmd_handler(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
 
 	/* Don't perform alua implicit transition if command is not supported */
 	switch(cdb[0]) {
+	/* Skip to grab the lock for reads */
 	case READ_6:
 	case READ_10:
 	case READ_12:
 	case READ_16:
+		is_read = true;
 	case WRITE_6:
 	case WRITE_10:
 	case WRITE_12:
@@ -2146,7 +2175,7 @@ static int tcmur_cmd_handler(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
 	case WRITE_SAME:
 	case WRITE_SAME_16:
 	case FORMAT_UNIT:
-		ret = alua_check_state(dev, cmd);
+		ret = alua_check_state(dev, cmd, is_read);
 		if (ret)
 			goto untrack;
 		break;

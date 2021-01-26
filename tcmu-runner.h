@@ -58,6 +58,12 @@ struct tcmur_cmd {
 	void (*done)(struct tcmu_device *dev, struct tcmur_cmd *cmd, int ret);
 };
 
+enum tcmur_event {
+	TCMUR_EVT_LOCK_LOST,
+	TCMUR_EVT_CONN_LOST,
+	TCMUR_EVT_CMD_TIMED_OUT,
+};
+
 struct tcmulib_cfg_info;
 
 struct tcmur_handler {
@@ -147,6 +153,13 @@ struct tcmur_handler {
 		     uint64_t off, uint64_t len);
 
 	/*
+	 * Notify the handler of an event.
+	 *
+	 * Return 0 on success and a -Exyz error code on error.
+	 */
+	int (*report_event)(struct tcmu_device *dev);
+
+	/*
 	 * If the lock is acquired and the tag is not TCMU_INVALID_LOCK_TAG,
 	 * it must be associated with the lock and returned by get_lock_tag on
 	 * local and remote nodes. When unlock is successful, the tag
@@ -181,6 +194,10 @@ struct tcmur_handler {
 	 * Update the logdir called by dynamic config thread.
 	 */
 	bool (*update_logdir)(void);
+
+	/* To init/destroy some global resrouces if needed */
+	int (*init)(void);
+	void (*destroy)(void);
 };
 
 void tcmur_cmd_complete(struct tcmu_device *dev, void *data, int rc);
