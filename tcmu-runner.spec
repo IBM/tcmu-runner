@@ -104,6 +104,8 @@ Requires:      libtcmu = %{version}-%{release}
 %description -n libtcmu-devel
 Development header(s) for developing against libtcmu.
 
+%global debug_package %{nil}
+
 %prep
 %setup -n %{name}-%{version}%{?_RC:-%{_RC}}
 
