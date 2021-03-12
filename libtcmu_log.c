@@ -183,6 +183,9 @@ static void log_output(struct log_buf *logbuf, int pri, const char *msg,
 {
 	char timestamp[TCMU_TIME_STRING_BUFLEN] = {0, };
 
+	if (!output)
+		return;
+
 	if (time_string_now(timestamp) < 0)
 		return;
 
@@ -400,6 +403,7 @@ static int output_to_fd(int pri, const char *timestamp,
 	int fd = (intptr_t) data;
 	char *buf, *msg;
 	int count, ret, written = 0, r, pid = 0;
+	char pname[TCMU_THREAD_NAME_LEN];
 
 	if (fd == -1)
 		return -1;
@@ -408,10 +412,14 @@ static int output_to_fd(int pri, const char *timestamp,
 	if (pid <= 0)
 		return -1;
 
+	if (pthread_getname_np(pthread_self(), pname, TCMU_THREAD_NAME_LEN))
+		return -1;
+
 	/*
 	 * format: timestamp pid [loglevel] msg
 	 */
-	ret = asprintf(&msg, "%s %d [%s] %s", timestamp, pid, loglevel_string(pri), str);
+	ret = asprintf(&msg, "%s %d:%s [%s] %s", timestamp, pid, pname,
+		       loglevel_string(pri), str);
 	if (ret < 0)
 		return -1;
 
@@ -516,7 +524,7 @@ static bool log_dequeue_msg(struct log_buf *logbuf)
 
 static void *log_thread_start(void *arg)
 {
-	tcmu_logbuf = arg;
+	tcmu_set_thread_name("logger", NULL);
 
 	pthread_cleanup_push(log_cleanup, arg);
 
@@ -539,7 +547,7 @@ static bool tcmu_log_dir_check(const char *path)
 		return false;
 
 	if (strlen(path) >= PATH_MAX - TCMU_LOG_FILENAME_MAX) {
-		tcmu_err("--tcmu-log-dir='%s' cannot exceed %d characters\n",
+		tcmu_err("The length of log dir path '%s' exceeds %d characters\n",
 			 path, PATH_MAX - TCMU_LOG_FILENAME_MAX - 1);
 		return false;
 	}
@@ -687,9 +695,11 @@ int tcmu_setup_log(char *log_dir)
 	if (ret < 0)
 		tcmu_err("create file output error \n");
 
+	tcmu_logbuf = logbuf;
 	ret = pthread_create(&logbuf->thread_id, NULL, log_thread_start,
 			     logbuf);
 	if (ret) {
+		tcmu_logbuf = NULL;
 		log_cleanup(logbuf);
 		return ret;
 	}

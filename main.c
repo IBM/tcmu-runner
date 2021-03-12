@@ -30,6 +30,7 @@
 #include <gio/gio.h>
 #include <getopt.h>
 #include <poll.h>
+#include <time.h>
 #include <scsi/scsi.h>
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -47,6 +48,7 @@
 #include "version.h"
 #include "libtcmu_config.h"
 #include "libtcmu_log.h"
+#include "tcmur_work.h"
 
 #define TCMU_LOCK_FILE   "/run/tcmu.lock"
 
@@ -66,6 +68,7 @@ struct tcmur_handler *tcmu_get_runner_handler(struct tcmu_device *dev)
 int tcmur_register_handler(struct tcmur_handler *handler)
 {
 	struct tcmur_handler *h;
+	int ret;
 	int i;
 
 	for (i = 0; i < darray_size(g_runner_handlers); i++) {
@@ -77,6 +80,16 @@ int tcmur_register_handler(struct tcmur_handler *handler)
 		}
 	}
 
+	if (handler->init) {
+		ret = handler->init();
+		if (ret) {
+			tcmu_err("Failed to init handler %s, ret = %d\n",
+				 handler->subtype, ret);
+			return ret;
+		}
+	}
+
+	tcmu_info("Handler %s is registered\n", handler->subtype);
 	darray_append(g_runner_handlers, handler);
 	return 0;
 }
@@ -104,6 +117,8 @@ static void free_dbus_handler(struct tcmur_handler *handler)
 	g_free((char*)handler->opaque);
 	g_free((char*)handler->subtype);
 	g_free((char*)handler->cfg_desc);
+	if (handler->destroy)
+		handler->destroy();
 	g_free(handler);
 }
 
@@ -119,6 +134,20 @@ static bool tcmur_unregister_dbus_handler(struct tcmur_handler *handler)
 	}
 
 	return ret;
+}
+
+static void tcmur_unregister_all_dbus_handlers(void)
+{
+	struct tcmur_handler *handler;
+	int i;
+	for (i = 0; i < darray_size(g_runner_handlers); i++) {
+		handler = darray_item(g_runner_handlers, i);
+		if (handler->_is_dbus_handler == true) {
+			if (tcmur_unregister_handler(handler))
+				free_dbus_handler(handler);
+		}
+	}
+	darray_free(g_runner_handlers);
 }
 
 static int is_handler(const struct dirent *dirent)
@@ -293,7 +322,7 @@ static void dbus_handler_close(struct tcmu_device *dev)
 }
 
 static int dbus_handler_handle_cmd(struct tcmu_device *dev,
-				   struct tcmulib_cmd *cmd)
+				   struct tcmur_cmd *tcmu_cmd)
 {
 	abort();
 }
@@ -599,7 +628,7 @@ static void tcmur_stop_device(void *arg)
 	 * The lock thread can fire off the recovery thread, so make sure
 	 * it is done first.
 	 */
-	tcmu_cancel_lock_thread(dev);
+	tcmur_flush_work(rdev->event_work);
 	tcmu_cancel_recovery(dev);
 
 	tcmu_release_dev_lock(dev);
@@ -621,6 +650,137 @@ static void tcmur_stop_device(void *arg)
 	tcmu_dev_dbg(dev, "cmdproc cleanup done\n");
 }
 
+int tcmur_get_time(struct tcmu_device *dev, struct timespec *time)
+{
+	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
+	int ret;
+
+	ret = clock_gettime(CLOCK_MONOTONIC_COARSE, time);
+	if (!ret) {
+		tcmu_dev_dbg(dev, "Current time %lu secs.\n", time->tv_sec);
+		return 0;
+	}
+
+	tcmu_dev_err(dev, "Could not get time. Error %d. Command timeout feature disabled.\n",
+		     ret);
+	rdev->cmd_time_out = 0;
+	return ret;
+}
+
+static bool get_next_cmd_timeout(struct tcmu_device *dev,
+				 struct timespec *curr_time,
+				 struct timespec *tmo)
+{
+	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
+	int run_time, cmd_tmo = rdev->cmd_time_out;
+	struct tcmur_cmd *tcmur_cmd;
+	bool has_timeout = false;
+
+	if (!cmd_tmo)
+		return false;
+
+	memset(tmo, 0, sizeof(*tmo));
+
+	pthread_spin_lock(&rdev->lock);
+	list_for_each(&rdev->cmds_list, tcmur_cmd, cmds_list_entry) {
+		if (tcmur_cmd->timed_out)
+			continue;
+
+		has_timeout = true;
+		run_time = difftime(curr_time->tv_sec,
+				    tcmur_cmd->start_time.tv_sec);
+		if (cmd_tmo > run_time) {
+			tmo->tv_sec = cmd_tmo - run_time;
+		} else {
+			/*
+			 * We do not do a clock call for every command, so
+			 * cmds can time out while we were processing new
+			 * cmds. Force a recheck.
+			 */
+			tmo->tv_sec = 0;
+		}
+
+		tcmu_dev_dbg(dev, "Next cmd id %hu timeout in %lu secs. Current time %lu. Start time %lu\n",
+			     tcmur_cmd->lib_cmd->cmd_id, tmo->tv_sec,
+			     curr_time->tv_sec, tcmur_cmd->start_time.tv_sec);
+		break;
+	}
+	pthread_spin_unlock(&rdev->lock);
+
+	return has_timeout;
+}
+
+static void check_for_timed_out_cmds(struct tcmu_device *dev)
+{
+	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
+	int cmd_tmo = rdev->cmd_time_out;
+	struct tcmur_cmd *tcmur_cmd;
+	struct timespec curr_time;
+	struct tcmulib_cmd *cmd;
+	int run_time;
+	uint8_t *cdb;
+
+	if (!cmd_tmo)
+		return;
+
+	memset(&curr_time, 0, sizeof(curr_time));
+
+	if (tcmur_get_time(dev, &curr_time))
+		return;
+
+	pthread_spin_lock(&rdev->lock);
+	list_for_each(&rdev->cmds_list, tcmur_cmd, cmds_list_entry) {
+		if (tcmur_cmd->timed_out)
+			continue;
+
+		run_time = difftime(curr_time.tv_sec,
+				    tcmur_cmd->start_time.tv_sec);
+		if (run_time < cmd_tmo)
+			continue;
+
+		cmd = tcmur_cmd->lib_cmd;
+
+		if (tcmu_get_log_level() == TCMU_LOG_DEBUG_SCSI_CMD) {
+			tcmu_cdb_print_info(dev, cmd, "timed out.");
+		} else {
+			cdb = cmd->cdb;
+			tcmu_dev_info(dev, "Command %hu SCSI CDB 0x%x at LBA %"PRIu64" for %u blocks timed out.\n",
+				      cmd->cmd_id, cdb[0],
+				      tcmu_cdb_get_lba(cdb),
+				      tcmu_cdb_get_xfer_length(cdb));
+		}
+
+		tcmur_cmd->timed_out = true;
+		/*
+		 * These time outs are only currently used for diagnostic
+		 * purposes right now, so we do not want to escalate the
+		 * error handler and just return true here.
+		 */
+	       tcmu_notify_cmd_timed_out(dev);
+	}
+	pthread_spin_unlock(&rdev->lock);
+}
+
+static void tcmur_tcmulib_cmd_start(struct tcmu_device *dev,
+				    struct tcmulib_cmd *cmd,
+				    struct timespec *curr_time)
+{
+	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
+	struct tcmur_cmd *tcmur_cmd = cmd->hm_private;
+
+	memset(tcmur_cmd, 0, sizeof(*tcmur_cmd));
+	tcmur_cmd->lib_cmd = cmd;
+	list_node_init(&tcmur_cmd->cmds_list_entry);
+
+	if (rdev->cmd_time_out) {
+		tcmur_cmd->start_time.tv_sec = curr_time->tv_sec;
+
+		pthread_spin_lock(&rdev->lock);
+		list_add_tail(&rdev->cmds_list, &tcmur_cmd->cmds_list_entry);
+		pthread_spin_unlock(&rdev->lock);
+	}
+}
+
 static void *tcmur_cmdproc_thread(void *arg)
 {
 	struct tcmu_device *dev = arg;
@@ -630,15 +790,26 @@ static void *tcmur_cmdproc_thread(void *arg)
 	int ret;
 	bool dev_stopping = false;
 
+	tcmu_set_thread_name("cmdproc", dev);
+
 	pthread_cleanup_push(tcmur_stop_device, dev);
 
 	while (1) {
 		int completed = 0;
 		struct tcmulib_cmd *cmd;
+		struct timespec tmo, curr_time;
+		bool set_tmo;
 
 		tcmulib_processing_start(dev);
 
-		while (!dev_stopping && (cmd = tcmulib_get_next_command(dev)) != NULL) {
+		if (rdev->cmd_time_out)
+			tcmur_get_time(dev, &curr_time);
+
+		while (!dev_stopping &&
+		       (cmd = tcmulib_get_next_command(dev,
+					sizeof(struct tcmur_cmd))) != NULL) {
+
+			tcmur_tcmulib_cmd_start(dev, cmd, &curr_time);
 
 			if (tcmu_get_log_level() == TCMU_LOG_DEBUG_SCSI_CMD)
 				tcmu_cdb_print_info(dev, cmd, NULL);
@@ -660,12 +831,14 @@ static void *tcmur_cmdproc_thread(void *arg)
 			 */
 			if (ret != TCMU_STS_ASYNC_HANDLED) {
 				completed = 1;
-				tcmur_command_complete(dev, cmd, ret);
+				tcmur_tcmulib_cmd_complete(dev, cmd, ret);
 			}
 		}
 
 		if (completed)
 			tcmulib_processing_complete(dev);
+
+		set_tmo = get_next_cmd_timeout(dev, &curr_time, &tmo);
 
 		pfd.fd = tcmu_dev_get_fd(dev);
 		pfd.events = POLLIN;
@@ -675,13 +848,19 @@ static void *tcmur_cmdproc_thread(void *arg)
 		 * handling. If we were removing a device, then the uio device's memory
 		 * could be freed, but the poll would be rescheduled and end up accessing
 		 * the released device. */
-		ret = ppoll(&pfd, 1, NULL, NULL);
+		if (set_tmo) {
+			ret = ppoll(&pfd, 1, &tmo, NULL);
+		} else {
+			ret = ppoll(&pfd, 1, NULL, NULL);
+		}
 		if (ret == -1) {
 			tcmu_err("ppoll() returned %d\n", ret);
 			break;
 		}
 
-		if (pfd.revents != POLLIN) {
+		if (!ret) {
+			check_for_timed_out_cmds(dev);
+		} else if (pfd.revents != POLLIN) {
 			tcmu_err("ppoll received unexpected revent: 0x%x\n", pfd.revents);
 			break;
 		}
@@ -711,18 +890,17 @@ static void *tcmur_cmdproc_thread(void *arg)
 static int dev_resize(struct tcmu_device *dev, struct tcmulib_cfg_info *cfg)
 {
 	struct tcmur_handler *rhandler = tcmu_get_runner_handler(dev);
+	uint64_t new_lbas = tcmu_byte_to_lba(dev, cfg->data.dev_size);
 	int ret;
 
-	if (tcmu_dev_get_num_lbas(dev) * tcmu_dev_get_block_size(dev) ==
-	    cfg->data.dev_size)
+	if (tcmu_dev_get_num_lbas(dev) == new_lbas)
 		return 0;
 
 	ret = rhandler->reconfig(dev, cfg);
 	if (ret)
 		return ret;
 
-	tcmu_dev_set_num_lbas(dev, cfg->data.dev_size /
-			      tcmu_dev_get_block_size(dev));
+	tcmu_dev_set_num_lbas(dev, new_lbas);
 	tcmur_set_pending_ua(dev, TCMUR_UA_DEV_SIZE_CHANGED);
 	return 0;
 }
@@ -742,6 +920,46 @@ static int dev_reconfig(struct tcmu_device *dev, struct tcmulib_cfg_info *cfg)
 	}
 }
 
+static void parse_tcmu_runner_args(struct tcmu_device *dev)
+{
+	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
+	char *arg, *cfg_str, *arg_end, *cfg_end;
+	bool found;
+
+	cfg_str = tcmu_dev_get_cfgstring(dev);
+	/* count ending null in string */
+	cfg_end = cfg_str + strlen(cfg_str) + 1;
+
+	while ((arg = strstr(cfg_str, ";"))) {
+		found = false;
+		arg++;
+
+		if (!strncmp(arg, "tcmur_cmd_time_out=", 19)) {
+			rdev->cmd_time_out = atoi(arg + 19);
+
+			tcmu_dev_dbg(dev, "Using tcmur_cmd_timeout %d\n",
+				     rdev->cmd_time_out);
+			found = true;
+		}
+
+		arg_end = strstr(arg, ";");
+		if (!arg_end) {
+			arg_end = cfg_end;
+		} else {
+			arg_end++;
+		}
+
+
+		if (found) {
+			memmove(arg - 1, arg_end, cfg_end - arg_end + 1);
+		} else {
+			cfg_str = arg;
+		}
+	}
+	tcmu_dev_dbg(dev, "Updated cfgstring: %s.\n",
+		     tcmu_dev_get_cfgstring(dev));
+}
+
 static int dev_added(struct tcmu_device *dev)
 {
 	struct tcmur_handler *rhandler = tcmu_get_runner_handler(dev);
@@ -757,7 +975,10 @@ static int dev_added(struct tcmu_device *dev)
 
 	tcmu_dev_set_private(dev, rdev);
 	list_node_init(&rdev->recovery_entry);
+	list_head_init(&rdev->cmds_list);
 	rdev->dev = dev;
+
+	parse_tcmu_runner_args(dev);
 
 	ret = -EINVAL;
 	block_size = tcmu_cfgfs_dev_get_attr_int(dev, "hw_block_size");
@@ -772,7 +993,7 @@ static int dev_added(struct tcmu_device *dev)
 		tcmu_dev_err(dev, "Could not get device size\n");
 		goto free_rdev;
 	}
-	tcmu_dev_set_num_lbas(dev, dev_size / block_size);
+	tcmu_dev_set_num_lbas(dev, tcmu_byte_to_lba(dev, dev_size));
 
 	max_sectors = tcmu_cfgfs_dev_get_attr_int(dev, "hw_max_sectors");
 	if (max_sectors < 0)
@@ -844,9 +1065,9 @@ static int dev_added(struct tcmu_device *dev)
 
 	rdev->flags |= TCMUR_DEV_FLAG_IS_OPEN;
 
-	ret = pthread_cond_init(&rdev->lock_cond, NULL);
-	if (ret) {
-		ret = -ret;
+	rdev->event_work = tcmur_create_work();
+	if (!rdev->event_work) {
+		ret = -ENOMEM;
 		goto close_dev;
 	}
 
@@ -854,13 +1075,13 @@ static int dev_added(struct tcmu_device *dev)
 			     dev);
 	if (ret) {
 		ret = -ret;
-		goto cleanup_lock_cond;
+		goto cleanup_event_work;
 	}
 
 	return 0;
 
-cleanup_lock_cond:
-	pthread_cond_destroy(&rdev->lock_cond);
+cleanup_event_work:
+	tcmur_destroy_work(rdev->event_work);
 close_dev:
 	rhandler->close(dev);
 cleanup_aio_tracking:
@@ -907,9 +1128,7 @@ static void dev_removed(struct tcmu_device *dev)
 	cleanup_io_work_queue(dev, false);
 	cleanup_aio_tracking(rdev);
 
-	ret = pthread_cond_destroy(&rdev->lock_cond);
-	if (ret != 0)
-		tcmu_err("could not cleanup lock cond %d\n", ret);
+	tcmur_destroy_work(rdev->event_work);
 
 	ret = pthread_mutex_destroy(&rdev->state_lock);
 	if (ret != 0)
@@ -1005,7 +1224,8 @@ int main(int argc, char **argv)
 {
 	darray(struct tcmulib_handler) handlers = darray_new();
 	struct tcmulib_context *tcmulib_context;
-	struct tcmur_handler **tmp_r_handler;
+	struct tcmur_handler **tmp_r_handler, *r_handler;
+	struct tcmulib_handler *handler;
 	GMainLoop *loop;
 	GIOChannel *libtcmu_gio;
 	guint reg_id;
@@ -1120,7 +1340,7 @@ int main(int argc, char **argv)
 		 * If it exists ignore errors and try to reset in case kernel is
 		 * in an invalid state
 		 */
-		tcmu_dbg("reseting netlink\n");
+		tcmu_dbg("resetting netlink\n");
 		tcmu_cfgfs_mod_param_set_u32("reset_netlink", 1);
 		tcmu_dbg("reset netlink done\n");
 	}
@@ -1217,6 +1437,13 @@ unwatch_cfg:
 		tcmu_unwatch_config(tcmu_cfg);
 	tcmulib_close(tcmulib_context);
 err_free_handlers:
+	tcmur_unregister_all_dbus_handlers();
+
+	darray_foreach(handler, handlers) {
+		r_handler = handler->hm_private;
+		if (r_handler && r_handler->destroy)
+			r_handler->destroy();
+	}
 	darray_free(handlers);
 close_fd:
 	if (reset_nl_supp)

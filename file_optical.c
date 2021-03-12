@@ -75,8 +75,6 @@ struct fbo_state {
 	int curr_handler;
 };
 
-static int fbo_handle_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd);
-
 static void fbo_report_op_change(struct tcmu_device *dev, uint8_t code)
 {
 	struct fbo_state *state = tcmur_dev_get_private(dev);
@@ -183,6 +181,7 @@ static void fbo_close(struct tcmu_device *dev)
 {
 	struct fbo_state *state = tcmur_dev_get_private(dev);
 
+	pthread_mutex_destroy(&state->state_mtx);
 	close(state->fd);
 	free(state);
 }
@@ -1005,6 +1004,8 @@ static void *fbo_async_sync_cache(void *arg)
 	struct fbo_state *state = tcmur_dev_get_private(dev);
 	uint8_t sense[SENSE_BUFFERSIZE];
 
+	tcmu_set_thread_name("fbo-cache", dev);
+
 	pthread_mutex_lock(&state->state_mtx);
 	state->async_cache_count++;
 	state->flags |= FBO_BUSY_EVENT;
@@ -1320,6 +1321,8 @@ static void *fbo_async_format(void *arg)
 	struct fbo_state *state = tcmur_dev_get_private(dev);
 	uint8_t sense[SENSE_BUFFERSIZE];
 
+	tcmu_set_thread_name("fbo-format", dev);
+
 	pthread_mutex_lock(&state->state_mtx);
 	state->flags |= FBO_BUSY_EVENT | FBO_FORMAT_IMMED;
 	pthread_mutex_unlock(&state->state_mtx);
@@ -1435,8 +1438,9 @@ static int fbo_emulate_read_format_capacities(struct tcmu_device *dev,
 /*
  * Return scsi status or TCMU_STS_NOT_HANDLED
  */
-static int fbo_handle_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
+static int fbo_handle_cmd(struct tcmu_device *dev, struct tcmur_cmd *tcmur_cmd)
 {
+	struct tcmulib_cmd *cmd = tcmur_cmd->lib_cmd;
 	uint8_t *cdb = cmd->cdb;
 	struct iovec *iovec = cmd->iovec;
 	size_t iov_cnt = cmd->iov_cnt;

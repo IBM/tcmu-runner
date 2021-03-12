@@ -952,12 +952,13 @@ static int zbc_evpd_inquiry(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
 	case 0x00:
 		/* Supported VPD pages */
 		data[3] = 5;
-		data[4] = 0x83;
-		data[5] = 0xb0;
-		data[6] = 0xb1;
-		data[7] = 0xb6;
+		data[4] = 0x0;
+		data[5] = 0x83;
+		data[6] = 0xb0;
+		data[7] = 0xb1;
+		data[8] = 0xb6;
 
-		tcmu_memcpy_into_iovec(iovec, iov_cnt, data, 8);
+		tcmu_memcpy_into_iovec(iovec, iov_cnt, data, 9);
 		break;
 
 	case 0x83:
@@ -2128,14 +2129,6 @@ static int zbc_write(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
 
 		/* Get the zone of the current LBA */
 		zone = zbc_get_zone(zdev, lba, false);
-		if (lba + nr_lbas > zone->start + zone->len) {
-			tcmu_dev_err(dev,
-				     "Write boundary violation lba %"PRIu64", xfer len %zu\n",
-				     lba, nr_lbas);
-			return tcmu_sense_set_data(cmd->sense_buf,
-						   ILLEGAL_REQUEST,
-						   ASC_WRITE_BOUNDARY_VIOLATION);
-		}
 
 		/* If the zone is not open, implicitly open it */
 		if (zbc_zone_seq(zone) && !zbc_zone_is_open(zone)) {
@@ -2216,8 +2209,9 @@ static int zbc_flush(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
  * Handle command emulation.
  * Return scsi status or TCMU_STS_NOT_HANDLED
  */
-static int zbc_handle_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
+static int zbc_handle_cmd(struct tcmu_device *dev, struct tcmur_cmd *tcmur_cmd)
 {
+	struct tcmulib_cmd *cmd = tcmur_cmd->lib_cmd;
 	uint8_t *cdb = cmd->cdb;
 	struct iovec *iovec = cmd->iovec;
 	size_t iov_cnt = cmd->iov_cnt;

@@ -25,6 +25,7 @@
 
 #include <scsi/scsi.h>
 
+#include "darray.h"
 #include "tcmu-runner.h"
 #include "tcmur_cmd_handler.h"
 #include "libtcmu.h"
@@ -80,6 +81,7 @@ struct tcmu_rbd_state {
 	char *osd_op_timeout;
 	char *conf_path;
 	char *id;
+	char *addrs;
 };
 
 enum rbd_aio_type {
@@ -90,7 +92,7 @@ enum rbd_aio_type {
 
 struct rbd_aio_cb {
 	struct tcmu_device *dev;
-	struct tcmulib_cmd *tcmulib_cmd;
+	struct tcmur_cmd *tcmur_cmd;
 
 	enum rbd_aio_type type;
 	union {
@@ -107,21 +109,29 @@ struct rbd_aio_cb {
 	size_t iov_cnt;
 };
 
+static pthread_mutex_t blacklist_caches_lock = PTHREAD_MUTEX_INITIALIZER;
+static darray(char *) blacklist_caches;
+
 #ifdef LIBRADOS_SUPPORTS_SERVICES
 
 #ifdef RBD_LOCK_ACQUIRE_SUPPORT
-static void tcmu_rbd_service_status_update(struct tcmu_device *dev,
-					   bool has_lock)
+static int tcmu_rbd_service_status_update(struct tcmu_device *dev,
+					  bool has_lock)
 {
 	struct tcmu_rbd_state *state = tcmur_dev_get_private(dev);
+	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
 	char *status_buf = NULL;
 	int ret;
 
-	ret = asprintf(&status_buf, "%s%c%s%c", "lock_owner", '\0',
-		       has_lock ? "true" : "false", '\0');
+	ret = asprintf(&status_buf,
+		       "%s%c%s%c%s%c%"PRIu64"%c%s%c%"PRIu64"%c%s%c%"PRIu64"%c",
+		       "lock_owner", '\0', has_lock ? "true" : "false", '\0',
+		       "lock_lost_cnt", '\0', rdev->lock_lost_cnt, '\0',
+		       "conn_lost_cnt", '\0', rdev->conn_lost_cnt, '\0',
+		       "cmd_timed_out_cnt", '\0', rdev->cmd_timed_out_cnt, '\0');
 	if (ret < 0) {
 		tcmu_dev_err(dev, "Could not allocate status buf. Service will not be updated.\n");
-		return;
+		return ret;
 	}
 
 	ret = rados_service_update_status(state->cluster, status_buf);
@@ -131,8 +141,23 @@ static void tcmu_rbd_service_status_update(struct tcmu_device *dev,
 	}
 
 	free(status_buf);
+	return ret;
 }
+
 #endif /* RBD_LOCK_ACQUIRE_SUPPORT */
+
+static int tcmu_rbd_report_event(struct tcmu_device *dev)
+{
+	struct tcmur_device *rdev = tcmu_dev_get_private(dev);
+
+	/*
+	 * We ignore the specific event and report all the current counter
+	 * values, because tools like gwcli/dashboard may not see every
+	 * update, and we do not want one event to overwrite the info.
+	 */
+	return tcmu_rbd_service_status_update(dev,
+			rdev->lock_state == TCMUR_DEV_LOCK_WRITE_LOCKED ? true : false);
+}
 
 static int tcmu_rbd_service_register(struct tcmu_device *dev)
 {
@@ -185,8 +210,14 @@ static int tcmu_rbd_service_register(struct tcmu_device *dev)
 	if (ret < 0) {
 		tcmu_dev_err(dev, "Could not register service to cluster. (Err %d)\n",
 			     ret);
+		goto free_meta_buf;
 	}
 
+	ret = tcmu_rbd_report_event(dev);
+	if (ret < 0)
+		tcmu_dev_err(dev, "Could not update status. (Err %d)\n", ret);
+
+free_meta_buf:
 	free(metadata_buf);
 free_daemon_buf:
 	free(daemon_buf);
@@ -212,6 +243,113 @@ static void tcmu_rbd_service_status_update(struct tcmu_device *dev,
 #endif /* RBD_LOCK_ACQUIRE_SUPPORT */
 
 #endif /* LIBRADOS_SUPPORTS_SERVICES */
+
+#if defined LIBRADOS_SUPPORTS_GETADDRS || defined RBD_LOCK_ACQUIRE_SUPPORT
+static void tcmu_rbd_rm_stale_entry_from_blacklist(struct tcmu_device *dev, char *addrs)
+{
+	struct tcmu_rbd_state *state = tcmur_dev_get_private(dev);
+	const char *p, *q, *end;
+	char *cmd, *addr;
+	int ret;
+
+	/*
+	 * Just skip extra chars before '[' if there has
+	 */
+	p = strchr(addrs, '[');
+	if (!p)
+		p = addrs;
+
+	/*
+	 * The addrs will a string like:
+	 * "[192.168.195.172:0/2203456141,192.168.195.172:0/4908756432]"
+	 * Or
+	 * "192.168.195.172:0/2203456141"
+	 */
+	while (1) {
+		if (p == NULL || *p == ']') {
+			return; /* we are done here */
+		} else if (*p == '[' || *p == ',') {
+			/* Skip "[" and white spaces */
+			while (*p != '\0' && !isalnum(*p)) p++;
+			if (*p == '\0') {
+				tcmu_dev_warn(dev, "Get an invalid address '%s'!\n", addrs);
+				return;
+			}
+
+			end = strchr(p, ',');
+			if (!end)
+				end = strchr(p, ']');
+
+			if (!end) {
+				tcmu_dev_warn(dev, "Get an invalid address '%s'!\n", addrs);
+				return;
+			}
+
+			q = end; /* The *end should be ',' or ']' */
+
+			while (*q != '\0' && !isalnum(*q)) q--;
+			if (*q == '\0') {
+				tcmu_dev_warn(dev, "Get an invalid address '%s'!\n", addrs);
+				return;
+			}
+
+			addr = strndup(p, q - p + 1);
+			p = end;
+		} else {
+			/* In case of "192.168.195.172:0/2203456141" */
+			addr = strdup(p);
+			p = NULL;
+		}
+
+		ret = asprintf(&cmd,
+			       "{\"prefix\": \"osd blacklist\","
+			       "\"blacklistop\": \"rm\","
+			       "\"addr\": \"%s\"}",
+			       addr);
+		free(addr);
+		if (ret < 0) {
+			tcmu_dev_warn(dev, "Could not allocate command. (Err %d)\n",
+				      ret);
+			return;
+		}
+		ret = rados_mon_command(state->cluster, (const char**)&cmd, 1, NULL, 0,
+					NULL, NULL, NULL, NULL);
+		free(cmd);
+		if (ret < 0) {
+			tcmu_dev_err(dev, "Could not rm blacklist entry '%s'. (Err %d)\n",
+				     addr, ret);
+			return;
+		}
+	}
+}
+
+static int tcmu_rbd_rm_stale_entries_from_blacklist(struct tcmu_device *dev)
+{
+	char **entry, *tmp_entry;
+	int ret = 0;
+	int i;
+
+	pthread_mutex_lock(&blacklist_caches_lock);
+	if (darray_empty(blacklist_caches))
+		goto unlock;
+
+	/* Try to remove all the stale blacklist entities */
+	darray_foreach(entry, blacklist_caches) {
+		tcmu_dev_info(dev, "removing addrs: {%s}\n", *entry);
+		tcmu_rbd_rm_stale_entry_from_blacklist(dev, *entry);
+	}
+
+unlock:
+	for (i = darray_size(blacklist_caches) - 1; i >= 0; i--) {
+		tmp_entry = darray_item(blacklist_caches, i);
+		darray_remove(blacklist_caches, i);
+		free(tmp_entry);
+	}
+
+	pthread_mutex_unlock(&blacklist_caches_lock);
+	return ret;
+}
+#endif // LIBRADOS_SUPPORTS_GETADDRS || RBD_LOCK_ACQUIRE_SUPPORT
 
 static char *tcmu_rbd_find_quote(char *string)
 {
@@ -512,8 +650,13 @@ static int tcmu_rbd_has_lock(struct tcmu_device *dev)
 
 	ret = rbd_is_exclusive_lock_owner(state->image, &is_owner);
 	if (ret < 0) {
-		tcmu_dev_err(dev, "Could not check lock ownership. Error: %s.\n",
-			     strerror(-ret));
+		if (ret == -ESHUTDOWN) {
+			tcmu_dev_dbg(dev, "Client is blacklisted. Could not check lock ownership.\n");
+		} else {
+			tcmu_dev_err(dev, "Could not check lock ownership. Error: %s.\n",
+				     strerror(-ret));
+		}
+
 		if (ret == -ESHUTDOWN || ret == -ETIMEDOUT)
 			return ret;
 
@@ -534,7 +677,7 @@ static int tcmu_rbd_get_lock_state(struct tcmu_device *dev)
 
 	ret = tcmu_rbd_has_lock(dev);
 	if (ret == 1)
-		return TCMUR_DEV_LOCK_LOCKED;
+		return TCMUR_DEV_LOCK_WRITE_LOCKED;
 	else if (ret == 0 || ret == -ESHUTDOWN)
 		return TCMUR_DEV_LOCK_UNLOCKED;
 	else
@@ -737,6 +880,11 @@ static int tcmu_rbd_unlock(struct tcmu_device *dev)
 static int tcmu_rbd_lock(struct tcmu_device *dev, uint16_t tag)
 {
 	struct tcmu_rbd_state *state = tcmur_dev_get_private(dev);
+#if !defined LIBRADOS_SUPPORTS_GETADDRS && defined RBD_LOCK_ACQUIRE_SUPPORT
+	rbd_lock_mode_t lock_mode;
+	char *owners1[1], *owners2[1];
+	size_t num_owners1 = 1, num_owners2 = 1;
+#endif
 	int ret;
 
 	ret = tcmu_rbd_has_lock(dev);
@@ -757,6 +905,41 @@ static int tcmu_rbd_lock(struct tcmu_device *dev, uint16_t tag)
 	ret = rbd_lock_acquire(state->image, RBD_LOCK_MODE_EXCLUSIVE);
 	if (ret)
 		goto done;
+
+#if !defined LIBRADOS_SUPPORTS_GETADDRS && defined RBD_LOCK_ACQUIRE_SUPPORT
+	ret = rbd_lock_get_owners(state->image, &lock_mode, owners1,
+				  &num_owners1);
+	if ((!ret && !num_owners1) || ret < 0) {
+		tcmu_dev_warn(dev, "Could not get lock owners to store blacklist entry %d!\n",
+			     ret);
+	} else {
+		int is_owner;
+
+		/* To check whether we are still the lock owner */
+		ret = rbd_is_exclusive_lock_owner(state->image, &is_owner);
+		if (ret) {
+			rbd_lock_get_owners_cleanup(owners1, num_owners1);
+			tcmu_dev_warn(dev, "Could not check lock owners to store blacklist entry %d!\n",
+				      ret);
+			goto no_owner;
+		}
+
+		/* To get the lock owner again */
+		ret = rbd_lock_get_owners(state->image, &lock_mode, owners2,
+				&num_owners2);
+		if ((!ret && !num_owners2) || ret < 0) {
+			tcmu_dev_warn(dev, "Could not get lock owners to store blacklist entry %d!\n",
+					ret);
+		/* Only we didn't lose the lock during the above check will we store the blacklist list */
+		} else if (!strcmp(owners1[0], owners2[0]) && is_owner) {
+			state->addrs = strdup(owners1[0]); // ignore the errors
+		}
+
+		rbd_lock_get_owners_cleanup(owners1, num_owners1);
+		rbd_lock_get_owners_cleanup(owners2, num_owners2);
+	}
+no_owner:
+#endif
 
 set_lock_tag:
 	tcmu_dev_warn(dev, "Acquired exclusive lock.\n");
@@ -806,6 +989,8 @@ static void tcmu_rbd_state_free(struct tcmu_rbd_state *state)
 		free(state->pool_name);
 	if (state->id)
 		free(state->id);
+	if (state->addrs)
+		free(state->addrs);
 	free(state);
 }
 
@@ -837,8 +1022,9 @@ static int tcmu_rbd_open(struct tcmu_device *dev, bool reopen)
 	char *pool, *name, *next_opt;
 	char *config, *dev_cfg_dup;
 	struct tcmu_rbd_state *state;
-	uint32_t max_blocks;
+	uint32_t max_blocks, unmap_gran;
 	int ret;
+	char buf[128];
 
 	state = calloc(1, sizeof(*state));
 	if (!state)
@@ -948,9 +1134,33 @@ static int tcmu_rbd_open(struct tcmu_device *dev, bool reopen)
 	max_blocks = (image_info.obj_size * 4) / tcmu_dev_get_block_size(dev);
 	tcmu_dev_set_opt_xcopy_rw_len(dev, max_blocks);
 	tcmu_dev_set_max_unmap_len(dev, max_blocks);
-	tcmu_dev_set_opt_unmap_gran(dev, image_info.obj_size /
-				    tcmu_dev_get_block_size(dev), false);
+	ret = rados_conf_get(state->cluster, "rbd_discard_granularity_bytes", buf,
+			     sizeof(buf));
+	if (!ret) {
+		tcmu_dev_dbg(dev, "rbd_discard_granularity_bytes: %s\n", buf);
+		unmap_gran = atoi(buf) / tcmu_dev_get_block_size(dev);
+	} else {
+		tcmu_dev_warn(dev,
+			      "Failed to get 'rbd_discard_granularity_bytes', %d\n",
+			      ret);
+		unmap_gran = image_info.obj_size / tcmu_dev_get_block_size(dev);
+	}
+	tcmu_dev_dbg(dev, "unmap_gran: %d\n", unmap_gran);
+	tcmu_dev_set_opt_unmap_gran(dev, unmap_gran, false);
+	tcmu_dev_set_unmap_gran_align(dev, unmap_gran);
 	tcmu_dev_set_write_cache_enabled(dev, 0);
+
+#if defined LIBRADOS_SUPPORTS_GETADDRS || defined RBD_LOCK_ACQUIRE_SUPPORT
+	tcmu_rbd_rm_stale_entries_from_blacklist(dev);
+#endif
+
+#ifdef LIBRADOS_SUPPORTS_GETADDRS
+	/* Get current entry address for the image */
+	ret = rados_getaddrs(state->cluster, &state->addrs);
+	tcmu_dev_info(dev, "address: {%s}\n", state->addrs);
+	if (ret < 0)
+		return ret;
+#endif
 
 	free(dev_cfg_dup);
 	return 0;
@@ -969,11 +1179,24 @@ static void tcmu_rbd_close(struct tcmu_device *dev)
 	struct tcmu_rbd_state *state = tcmur_dev_get_private(dev);
 
 	tcmu_rbd_image_close(dev);
+
+	/*
+	 * Since we are closing the device, but current device maybe
+	 * already blacklisted by other tcmu nodes. Let's just save
+	 * the entity addrs into the blacklist_caches, and let any
+	 * other new device help remove it.
+	 */
+	if (state->addrs) {
+		pthread_mutex_lock(&blacklist_caches_lock);
+		darray_append(blacklist_caches, state->addrs);
+		pthread_mutex_unlock(&blacklist_caches_lock);
+		state->addrs = NULL;
+	}
+
 	tcmu_rbd_state_free(state);
 }
 
-static int tcmu_rbd_handle_blacklisted_cmd(struct tcmu_device *dev,
-					   struct tcmulib_cmd *cmd)
+static int tcmu_rbd_handle_blacklisted_cmd(struct tcmu_device *dev)
 {
 	tcmu_notify_lock_lost(dev);
 	/*
@@ -991,11 +1214,10 @@ static int tcmu_rbd_handle_blacklisted_cmd(struct tcmu_device *dev,
  * we will end up failing the transport connection when we just needed
  * to try a different OSD.
  */
-static int tcmu_rbd_handle_timedout_cmd(struct tcmu_device *dev,
-					struct tcmulib_cmd *cmd)
+static int tcmu_rbd_handle_timedout_cmd(struct tcmu_device *dev)
 {
 	tcmu_dev_err(dev, "Timing out cmd.\n");
-	tcmu_notify_conn_lost(dev);
+	tcmu_notify_cmd_timed_out(dev);
 
 	/*
 	 * TODO: For AA, we will want to kill the ceph tcp connections
@@ -1080,7 +1302,7 @@ static void rbd_finish_aio_generic(rbd_completion_t completion,
 				   struct rbd_aio_cb *aio_cb)
 {
 	struct tcmu_device *dev = aio_cb->dev;
-	struct tcmulib_cmd *tcmulib_cmd = aio_cb->tcmulib_cmd;
+	struct tcmur_cmd *tcmur_cmd = aio_cb->tcmur_cmd;
 	struct iovec *iov = aio_cb->iov;
 	size_t iov_cnt = aio_cb->iov_cnt;
 	uint32_t cmp_offset;
@@ -1091,15 +1313,15 @@ static void rbd_finish_aio_generic(rbd_completion_t completion,
 	rbd_aio_release(completion);
 
 	if (ret == -ETIMEDOUT) {
-		tcmu_r = tcmu_rbd_handle_timedout_cmd(dev, tcmulib_cmd);
+		tcmu_r = tcmu_rbd_handle_timedout_cmd(dev);
 	} else if (ret == -ESHUTDOWN || ret == -EROFS) {
-		tcmu_r = tcmu_rbd_handle_blacklisted_cmd(dev, tcmulib_cmd);
+		tcmu_r = tcmu_rbd_handle_blacklisted_cmd(dev);
 	} else if (ret == -EILSEQ && aio_cb->type == RBD_AIO_TYPE_CAW) {
 		cmp_offset = aio_cb->caw.miscompare_offset - aio_cb->caw.offset;
 		tcmu_dev_dbg(dev, "CAW miscompare at offset %u.\n", cmp_offset);
 
 		tcmu_r = TCMU_STS_MISCOMPARE;
-		tcmu_sense_set_info(tcmulib_cmd->sense_buf, cmp_offset);
+		tcmu_sense_set_info(tcmur_cmd->lib_cmd->sense_buf, cmp_offset);
 	} else if (ret == -EINVAL) {
 		tcmu_dev_err(dev, "Invalid IO request.\n");
 		tcmu_r = TCMU_STS_INVALID_CDB;
@@ -1120,14 +1342,14 @@ static void rbd_finish_aio_generic(rbd_completion_t completion,
 		}
 	}
 
-	tcmulib_cmd->done(dev, tcmulib_cmd, tcmu_r);
+	tcmur_cmd_complete(dev, tcmur_cmd, tcmu_r);
 
 	if (aio_cb->bounce_buffer)
 		free(aio_cb->bounce_buffer);
 	free(aio_cb);
 }
 
-static int tcmu_rbd_read(struct tcmu_device *dev, struct tcmulib_cmd *cmd,
+static int tcmu_rbd_read(struct tcmu_device *dev, struct tcmur_cmd *tcmur_cmd,
 			     struct iovec *iov, size_t iov_cnt, size_t length,
 			     off_t offset)
 {
@@ -1144,7 +1366,7 @@ static int tcmu_rbd_read(struct tcmu_device *dev, struct tcmulib_cmd *cmd,
 	aio_cb->dev = dev;
 	aio_cb->type = RBD_AIO_TYPE_READ;
 	aio_cb->read.length = length;
-	aio_cb->tcmulib_cmd = cmd;
+	aio_cb->tcmur_cmd = tcmur_cmd;
 	aio_cb->iov = iov;
 	aio_cb->iov_cnt = iov_cnt;
 
@@ -1169,7 +1391,7 @@ out:
 	return TCMU_STS_NO_RESOURCE;
 }
 
-static int tcmu_rbd_write(struct tcmu_device *dev, struct tcmulib_cmd *cmd,
+static int tcmu_rbd_write(struct tcmu_device *dev, struct tcmur_cmd *tcmur_cmd,
 			  struct iovec *iov, size_t iov_cnt, size_t length,
 			  off_t offset)
 {
@@ -1185,7 +1407,7 @@ static int tcmu_rbd_write(struct tcmu_device *dev, struct tcmulib_cmd *cmd,
 
 	aio_cb->dev = dev;
 	aio_cb->type = RBD_AIO_TYPE_WRITE;
-	aio_cb->tcmulib_cmd = cmd;
+	aio_cb->tcmur_cmd = tcmur_cmd;
 
 	ret = rbd_aio_create_completion
 		(aio_cb, (rbd_callback_t) rbd_finish_aio_generic, &completion);
@@ -1210,7 +1432,7 @@ out:
 }
 
 #ifdef RBD_DISCARD_SUPPORT
-static int tcmu_rbd_unmap(struct tcmu_device *dev, struct tcmulib_cmd *cmd,
+static int tcmu_rbd_unmap(struct tcmu_device *dev, struct tcmur_cmd *tcmur_cmd,
 			  uint64_t off, uint64_t len)
 {
 	struct tcmu_rbd_state *state = tcmur_dev_get_private(dev);
@@ -1225,7 +1447,7 @@ static int tcmu_rbd_unmap(struct tcmu_device *dev, struct tcmulib_cmd *cmd,
 	}
 
 	aio_cb->dev = dev;
-	aio_cb->tcmulib_cmd = cmd;
+	aio_cb->tcmur_cmd = tcmur_cmd;
 	aio_cb->type = RBD_AIO_TYPE_WRITE;
 	aio_cb->bounce_buffer = NULL;
 
@@ -1251,7 +1473,7 @@ out:
 
 #ifdef LIBRBD_SUPPORTS_AIO_FLUSH
 
-static int tcmu_rbd_flush(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
+static int tcmu_rbd_flush(struct tcmu_device *dev, struct tcmur_cmd *tcmur_cmd)
 {
 	struct tcmu_rbd_state *state = tcmur_dev_get_private(dev);
 	struct rbd_aio_cb *aio_cb;
@@ -1265,7 +1487,7 @@ static int tcmu_rbd_flush(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
 	}
 
 	aio_cb->dev = dev;
-	aio_cb->tcmulib_cmd = cmd;
+	aio_cb->tcmur_cmd = tcmur_cmd;
 	aio_cb->type = RBD_AIO_TYPE_WRITE;
 	aio_cb->bounce_buffer = NULL;
 
@@ -1294,7 +1516,7 @@ out:
 
 #ifdef RBD_WRITE_SAME_SUPPORT
 static int tcmu_rbd_aio_writesame(struct tcmu_device *dev,
-				  struct tcmulib_cmd *cmd,
+				  struct tcmur_cmd *tcmur_cmd,
 				  uint64_t off, uint64_t len,
 				  struct iovec *iov, size_t iov_cnt)
 {
@@ -1311,7 +1533,7 @@ static int tcmu_rbd_aio_writesame(struct tcmu_device *dev,
 	}
 
 	aio_cb->dev = dev;
-	aio_cb->tcmulib_cmd = cmd;
+	aio_cb->tcmur_cmd = tcmur_cmd;
 	aio_cb->type = RBD_AIO_TYPE_WRITE;
 
 	aio_cb->bounce_buffer = malloc(length);
@@ -1348,7 +1570,7 @@ out:
 #endif /* RBD_WRITE_SAME_SUPPORT */
 
 #ifdef RBD_COMPARE_AND_WRITE_SUPPORT
-static int tcmu_rbd_aio_caw(struct tcmu_device *dev, struct tcmulib_cmd *cmd,
+static int tcmu_rbd_aio_caw(struct tcmu_device *dev, struct tcmur_cmd *tcmur_cmd,
 			    uint64_t off, uint64_t len, struct iovec *iov,
 			    size_t iov_cnt)
 {
@@ -1365,7 +1587,7 @@ static int tcmu_rbd_aio_caw(struct tcmu_device *dev, struct tcmulib_cmd *cmd,
 	}
 
 	aio_cb->dev = dev;
-	aio_cb->tcmulib_cmd = cmd;
+	aio_cb->tcmur_cmd = tcmur_cmd;
 	aio_cb->type = RBD_AIO_TYPE_CAW;
 	aio_cb->caw.offset = off;
 
@@ -1407,33 +1629,6 @@ out:
 }
 #endif /* RBD_COMPARE_AND_WRITE_SUPPORT */
 
-/*
- * Return scsi status or TCMU_STS_NOT_HANDLED
- */
-static int tcmu_rbd_handle_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
-{
-	uint8_t *cdb = cmd->cdb;
-	int ret;
-
-	switch(cdb[0]) {
-#ifdef RBD_WRITE_SAME_SUPPORT
-	case WRITE_SAME:
-	case WRITE_SAME_16:
-		ret = tcmur_handle_writesame(dev, cmd, tcmu_rbd_aio_writesame);
-		break;
-#endif
-#ifdef RBD_COMPARE_AND_WRITE_SUPPORT
-	case COMPARE_AND_WRITE:
-		ret = tcmur_handle_caw(dev, cmd, tcmu_rbd_aio_caw);
-		break;
-#endif
-	default:
-		ret = TCMU_STS_NOT_HANDLED;
-	}
-
-	return ret;
-}
-
 static int tcmu_rbd_reconfig(struct tcmu_device *dev,
 			     struct tcmulib_cfg_info *cfg)
 {
@@ -1450,6 +1645,31 @@ static int tcmu_rbd_reconfig(struct tcmu_device *dev,
 	default:
 		return -EOPNOTSUPP;
 	}
+}
+
+static int tcmu_rbd_init(void)
+{
+	darray_init(blacklist_caches);
+	return 0;
+}
+
+static void tcmu_rbd_destroy(void)
+{
+	char **entry;
+
+	tcmu_info("destroying the rbd handler\n");
+	pthread_mutex_lock(&blacklist_caches_lock);
+	if (darray_empty(blacklist_caches))
+		goto unlock;
+
+	/* Try to remove all the stale blacklist entities */
+	darray_foreach(entry, blacklist_caches)
+		free(*entry);
+
+	darray_free(blacklist_caches);
+
+unlock:
+	pthread_mutex_unlock(&blacklist_caches_lock);
 }
 
 /*
@@ -1482,19 +1702,29 @@ struct tcmur_handler tcmu_rbd_handler = {
 	.read	       = tcmu_rbd_read,
 	.write	       = tcmu_rbd_write,
 	.reconfig      = tcmu_rbd_reconfig,
+#ifdef LIBRADOS_SUPPORTS_SERVICES
+	.report_event  = tcmu_rbd_report_event,
+#endif
 #ifdef LIBRBD_SUPPORTS_AIO_FLUSH
 	.flush	       = tcmu_rbd_flush,
 #endif
 #ifdef RBD_DISCARD_SUPPORT
 	.unmap         = tcmu_rbd_unmap,
 #endif
-	.handle_cmd    = tcmu_rbd_handle_cmd,
+#ifdef RBD_WRITE_SAME_SUPPORT
+	.writesame     = tcmu_rbd_aio_writesame,
+#endif
+#ifdef RBD_COMPARE_AND_WRITE_SUPPORT
+	.caw           = tcmu_rbd_aio_caw,
+#endif
 #ifdef RBD_LOCK_ACQUIRE_SUPPORT
 	.lock          = tcmu_rbd_lock,
 	.unlock        = tcmu_rbd_unlock,
 	.get_lock_tag  = tcmu_rbd_get_lock_tag,
 	.get_lock_state = tcmu_rbd_get_lock_state,
 #endif
+	.init          = tcmu_rbd_init,
+	.destroy       = tcmu_rbd_destroy,
 };
 
 int handler_init(void)

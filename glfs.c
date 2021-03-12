@@ -37,6 +37,10 @@
 /* cache protection */
 pthread_mutex_t glfs_lock;
 
+#if GFAPI_VERSION766
+#define GF_ENFORCE_MANDATORY_LOCK "trusted.glusterfs.enforce-mandatory-lock"
+#endif
+
 typedef enum gluster_transport {
 	GLUSTER_TRANSPORT_TCP,
 	GLUSTER_TRANSPORT_UNIX,
@@ -71,6 +75,7 @@ struct glfs_state {
 	glfs_t *fs;
 	glfs_fd_t *gfd;
 	gluster_server *hosts;
+	bool no_fencing;
 
 	/*
 	 * Current tcmu helper API reports WCE=1, but doesn't
@@ -81,7 +86,7 @@ struct glfs_state {
 
 typedef struct glfs_cbk_cookie {
 	struct tcmu_device *dev;
-	struct tcmulib_cmd *cmd;
+	struct tcmur_cmd *tcmur_cmd;
 	size_t length;
 	enum {
 		TCMU_GLFS_READ  = 1,
@@ -99,7 +104,7 @@ struct gluster_cacheconn {
 	darray(char *) cfgstring;
 } gluster_cacheconn;
 
-static darray(struct gluster_cacheconn *) glfs_cache = darray_new();
+static darray(struct gluster_cacheconn *) glfs_cache;
 
 const char *const gluster_transport_lookup[] = {
 	[GLUSTER_TRANSPORT_TCP] = "tcp",
@@ -530,6 +535,18 @@ static int tcmu_glfs_open(struct tcmu_device *dev, bool reopen)
 		goto unref;
 	}
 
+#if GFAPI_VERSION766
+	ret = glfs_fsetxattr(gfsp->gfd, GF_ENFORCE_MANDATORY_LOCK, "set", 4, 0);
+	if (ret) {
+		if (errno == EINVAL) {
+			gfsp->no_fencing = true;
+		} else {
+			tcmu_dev_err(dev,"glfs_fsetxattr failed: %m\n");
+			goto close;
+		}
+	}
+#endif
+
 	ret = glfs_lstat(gfsp->fs, gfsp->hosts->path, &st);
 	if (ret) {
 		tcmu_dev_warn(dev, "glfs_lstat failed: %m\n");
@@ -546,23 +563,19 @@ static int tcmu_glfs_open(struct tcmu_device *dev, bool reopen)
 		if (round_down(st.st_size, block_size) == dev_size)
 			goto out;
 
-		if (!reopen) {
-			ret = -EINVAL;
-			goto close;
-		}
+		if (reopen)
+			goto out;
 
-		/*
-		 * If we are here this should be in reopen path,
-		 * then we should also update the device size in
-		 * kernel.
-		 */
-		tcmu_dev_info(dev,
-			      "device size and backing size disagree:device %lld backing %lld\n",
-			      dev_size, (long long) st.st_size);
+		tcmu_dev_warn(dev,
+			      "device size (%lld) and backing file size (%lld) not matching, updating it to kernel\n",
+			      (long long)dev_size, (long long) st.st_size);
 
+		/* Update the device size in kernel. */
 		ret = tcmur_dev_update_size(dev, st.st_size);
 		if (ret)
 			goto close;
+
+		tcmu_dev_info(dev, "loaded with size (%lld)\n", (long long) st.st_size);
 	}
 
 out:
@@ -599,13 +612,64 @@ static void glfs_async_cbk(glfs_fd_t *fd, ssize_t ret, void *data)
 {
 	glfs_cbk_cookie *cookie = data;
 	struct tcmu_device *dev = cookie->dev;
-	struct tcmulib_cmd *cmd = cookie->cmd;
+	struct tcmur_cmd *tcmur_cmd = cookie->tcmur_cmd;
+#if GFAPI_VERSION766
+	struct glfs_state *gfsp = tcmur_dev_get_private(dev);
+#endif
 	size_t length = cookie->length;
+	int err = -errno;
 
-	if (ret < 0 || ret != length) {
+	if (ret < 0) {
+		switch (err) {
+		case -ETIMEDOUT:
+			/*
+			 * TIMEDOUT is a scenario where the fop can
+			 * not reach the server for 30 minutes.
+			 */
+			tcmu_dev_err(dev, "Timing out cmd after 30 minutes.\n");
+
+			tcmu_notify_cmd_timed_out(dev);
+			ret = TCMU_STS_TIMEOUT;
+			break;
+#if GFAPI_VERSION766
+		case -EAGAIN:
+		case -EBUSY:
+		case -ENOTCONN:
+			/*
+			 * The lock maybe preemted and then any IO to
+			 * land on the file without a lock will be
+			 * rejected with EBUSY.
+			 *
+			 * And if local is disconnected, we should get
+			 * ENOTCONN for further requests. But if the
+			 * connection is reestablished and at the same
+			 * time another client has taken the lock we
+			 * will get EBUSY too.
+			 */
+			if (!gfsp->no_fencing) {
+				tcmu_dev_dbg(dev, "failed with errno %d.\n", err);
+				tcmu_notify_lock_lost(dev);
+				ret = TCMU_STS_BUSY;
+				break;
+			}
+#endif
+		default:
+			tcmu_dev_dbg(dev, "failed with errno %d.\n", err);
+			ret = TCMU_STS_HW_ERR;
+		}
+	} else if (ret != length) {
+		tcmu_dev_dbg(dev, "ret(%zu) != length(%zu).\n", ret, length);
+
 		/* Read/write/flush failed */
 		switch (cookie->op) {
 		case TCMU_GLFS_READ:
+			/* ENOENT for READ operation means EOF,
+			 * see glusterfs commit 9fe5c6d3
+			 */
+			if (err == -ENOENT) {
+				ret = TCMU_STS_OK;
+				break;
+			}
 			ret = TCMU_STS_RD_ERR;
 			break;
 		case TCMU_GLFS_WRITE:
@@ -619,12 +683,12 @@ static void glfs_async_cbk(glfs_fd_t *fd, ssize_t ret, void *data)
 		ret = TCMU_STS_OK;
 	}
 
-	cmd->done(dev, cmd, ret);
+	tcmur_cmd_complete(dev, tcmur_cmd, ret);
 	free(cookie);
 }
 
 static int tcmu_glfs_read(struct tcmu_device *dev,
-                          struct tcmulib_cmd *cmd,
+                          struct tcmur_cmd *tcmur_cmd,
                           struct iovec *iov, size_t iov_cnt,
                           size_t length, off_t offset)
 {
@@ -637,7 +701,7 @@ static int tcmu_glfs_read(struct tcmu_device *dev,
 		goto out;
 	}
 	cookie->dev = dev;
-	cookie->cmd = cmd;
+	cookie->tcmur_cmd = tcmur_cmd;
 	cookie->length = length;
 	cookie->op = TCMU_GLFS_READ;
 
@@ -656,7 +720,7 @@ out:
 }
 
 static int tcmu_glfs_write(struct tcmu_device *dev,
-                           struct tcmulib_cmd *cmd,
+                           struct tcmur_cmd *tcmur_cmd,
                            struct iovec *iov, size_t iov_cnt,
                            size_t length, off_t offset)
 {
@@ -669,7 +733,7 @@ static int tcmu_glfs_write(struct tcmu_device *dev,
 		goto out;
 	}
 	cookie->dev = dev;
-	cookie->cmd = cmd;
+	cookie->tcmur_cmd = tcmur_cmd;
 	cookie->length = length;
 	cookie->op = TCMU_GLFS_WRITE;
 
@@ -704,10 +768,15 @@ static int tcmu_glfs_reconfig(struct tcmu_device *dev,
 			/* Let the targetcli command return success */
 			ret = 0;
 		} else if (st.st_size != cfg->data.dev_size) {
-			tcmu_dev_err(dev,
-				     "device size and backing size disagree: device %"PRId64" backing %lld\n",
-				     cfg->data.dev_size, (long long) st.st_size);
-			ret = -EINVAL;
+			/*
+			 * Currently we cannot update the size to kernel here,
+			 * because it will be overrided by kernel with the old
+			 * value after it gets the genl reply.
+			 */
+			tcmu_dev_warn(dev,
+				      "device size (%lld) and backing file size (%lld) not matching, and ignoring it\n",
+				      (long long)cfg->data.dev_size, (long long) st.st_size);
+			return -EINVAL;
 		}
 		return ret;
 	case TCMULIB_CFG_DEV_CFGSTR:
@@ -718,7 +787,7 @@ static int tcmu_glfs_reconfig(struct tcmu_device *dev,
 }
 
 static int tcmu_glfs_flush(struct tcmu_device *dev,
-                           struct tcmulib_cmd *cmd)
+                           struct tcmur_cmd *tcmur_cmd)
 {
 	struct glfs_state *state = tcmur_dev_get_private(dev);
 	glfs_cbk_cookie *cookie;
@@ -729,7 +798,7 @@ static int tcmu_glfs_flush(struct tcmu_device *dev,
 		goto out;
 	}
 	cookie->dev = dev;
-	cookie->cmd = cmd;
+	cookie->tcmur_cmd = tcmur_cmd;
 	cookie->length = 0;
 	cookie->op = TCMU_GLFS_FLUSH;
 
@@ -746,7 +815,8 @@ out:
 	return TCMU_STS_NO_RESOURCE;
 }
 
-static int tcmu_glfs_discard(struct tcmu_device *dev, struct tcmulib_cmd *cmd,
+static int tcmu_glfs_discard(struct tcmu_device *dev,
+			     struct tcmur_cmd *tcmur_cmd,
                              uint64_t offset, uint64_t length)
 {
 	struct glfs_state *state = tcmur_dev_get_private(dev);
@@ -759,7 +829,7 @@ static int tcmu_glfs_discard(struct tcmu_device *dev, struct tcmulib_cmd *cmd,
 		goto out;
 	}
 	cookie->dev = dev;
-	cookie->cmd = cmd;
+	cookie->tcmur_cmd = tcmur_cmd;
 	cookie->length = 0;
 	cookie->op = TCMU_GLFS_DISCARD;
 
@@ -778,7 +848,7 @@ out:
 }
 
 static int tcmu_glfs_writesame(struct tcmu_device *dev,
-			       struct tcmulib_cmd *cmd,
+			       struct tcmur_cmd *tcmur_cmd,
 			       uint64_t offset, uint64_t length,
 			       struct iovec *iov, size_t iov_cnt)
 {
@@ -798,7 +868,7 @@ static int tcmu_glfs_writesame(struct tcmu_device *dev,
 		goto out;
 	}
 	cookie->dev = dev;
-	cookie->cmd = cmd;
+	cookie->tcmur_cmd = tcmur_cmd;
 	cookie->length = 0;
 	cookie->op = TCMU_GLFS_WRITESAME;
 
@@ -816,24 +886,71 @@ out:
 	return TCMU_STS_NO_RESOURCE;
 }
 
-/*
- * Return scsi status or TCMU_STS_NOT_HANDLED
- */
-static int tcmu_glfs_handle_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
+#if GFAPI_VERSION766
+static int tcmu_glfs_to_sts(int rc)
 {
-	uint8_t *cdb = cmd->cdb;
+	switch (rc) {
+	case 0:
+		return TCMU_STS_OK;
+	case -ENOTCONN:
+		return TCMU_STS_FENCED;
+	default:
+		return TCMU_STS_HW_ERR;
+	}
+}
+
+static int tcmu_glfs_lock(struct tcmu_device *dev, uint16_t tag)
+{
+	struct glfs_state *state = tcmur_dev_get_private(dev);
+	struct flock lock;
 	int ret;
 
-	switch(cdb[0]) {
-	case WRITE_SAME:
-	case WRITE_SAME_16:
-		ret = tcmur_handle_writesame(dev, cmd, tcmu_glfs_writesame);
-		break;
-	default:
-		ret = TCMU_STS_NOT_HANDLED;
-	}
+	if (state->no_fencing)
+		return 0;
 
-	return ret;
+	lock.l_type = F_WRLCK | F_RDLCK;
+	lock.l_whence = SEEK_SET;
+	lock.l_start = 0;
+	lock.l_len = 0;
+
+	ret = glfs_file_lock(state->gfd, F_SETLK, &lock, GLFS_LK_MANDATORY);
+	if (ret)
+		tcmu_dev_err(dev, "glfs_file_lock failed: %m\n");
+
+	return tcmu_glfs_to_sts(ret);
+}
+
+static int tcmu_glfs_unlock(struct tcmu_device *dev)
+{
+	struct glfs_state *state = tcmur_dev_get_private(dev);
+	struct flock lock;
+	int ret;
+
+	if (state->no_fencing)
+		return 0;
+
+	lock.l_type = F_UNLCK;
+	lock.l_whence = SEEK_SET;
+	lock.l_start = 0;
+	lock.l_len = 0;
+
+	ret = glfs_file_lock(state->gfd, F_SETLK, &lock, GLFS_LK_MANDATORY);
+	if (ret)
+		tcmu_dev_err(dev, "glfs_file_lock failed: %m\n");
+
+	return tcmu_glfs_to_sts(ret);
+}
+#endif
+
+static int tcmu_glfs_init(void)
+{
+	darray_init(glfs_cache);
+	return 0;
+}
+
+static void tcmu_glfs_destroy(void)
+{
+	darray_free(glfs_cache);
 }
 
 /*
@@ -868,9 +985,16 @@ struct tcmur_handler glfs_handler = {
 	.reconfig       = tcmu_glfs_reconfig,
 	.flush          = tcmu_glfs_flush,
 	.unmap          = tcmu_glfs_discard,
-	.handle_cmd     = tcmu_glfs_handle_cmd,
+	.writesame      = tcmu_glfs_writesame,
 
 	.update_logdir  = tcmu_glfs_update_logdir,
+
+#if GFAPI_VERSION766
+	.lock           = tcmu_glfs_lock,
+	.unlock         = tcmu_glfs_unlock,
+#endif
+	.init           = tcmu_glfs_init,
+	.destroy        = tcmu_glfs_destroy,
 };
 
 /* Entry point must be named "handler_init". */
