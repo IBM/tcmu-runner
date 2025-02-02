@@ -1379,3 +1379,58 @@ void tcmulib_processing_complete(struct tcmu_device *dev)
 		tcmu_err("failed to write device /dev/%s, %d\n",
 			 dev->dev_name, errno);
 }
+
+struct tcmulib_cmd *tcmu_peek_cmd(struct tcmu_device *dev)
+{
+	struct tcmu_mailbox *mb = dev->map;
+	struct tcmu_cmd_entry *ent;
+
+	while ((ent = device_cmd_tail(dev)) != device_cmd_head(dev)) {
+		if (tcmu_hdr_get_op(ent->hdr.len_op) == TCMU_OP_CMD) {
+			struct tcmulib_cmd *cmd;
+			uint8_t *cdb = (uint8_t *) mb + ent->req.cdb_off;
+			int cdb_len = tcmu_cdb_get_length(cdb);
+
+			cmd = malloc(sizeof(*cmd) + sizeof(*cmd->iovec) * ent->req.iov_cnt + cdb_len);
+			if (!cmd)
+				return NULL;
+			cmd->cmd_id = ent->hdr.cmd_id;
+
+			cmd->iov_cnt = ent->req.iov_cnt;
+			cmd->iovec = (struct iovec *) (cmd + 1);
+			for (int i = 0; i < ent->req.iov_cnt; i++) {
+				cmd->iovec[i].iov_base = (void *) mb +
+					(size_t) ent->req.iov[i].iov_base;
+				cmd->iovec[i].iov_len = ent->req.iov[i].iov_len;
+			}
+
+			cmd->cdb = (uint8_t *) (cmd->iovec + cmd->iov_cnt);
+			memcpy(cmd->cdb, (void *) mb + ent->req.cdb_off, cdb_len);
+
+			TCMU_UPDATE_DEV_TAIL(dev, mb, ent);
+			return cmd;
+		} else {
+			break;
+		}
+
+	TCMU_UPDATE_DEV_TAIL(dev, mb, ent);
+
+	}
+
+	return NULL;
+}
+
+uint32_t tcmu_get_cmd_tail(struct tcmu_device *dev)
+{
+	return dev->cmd_tail;
+}
+
+void tcmu_set_cmd_tail(struct tcmu_device *dev, uint32_t cmd_tail)
+{
+	dev->cmd_tail = cmd_tail;
+}
+
+char *tcmu_get_dev_name(struct tcmu_device *dev)
+{
+	return dev->tcm_dev_name;
+}

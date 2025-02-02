@@ -143,6 +143,10 @@ bool tcmu_dev_get_write_protect_enabled(struct tcmu_device *dev);
 struct tcmulib_handler *tcmu_dev_get_handler(struct tcmu_device *dev);
 void tcmu_dev_flush_ring(struct tcmu_device *dev);
 bool tcmu_dev_oooc_supported(struct tcmu_device* dev);
+struct tcmulib_cmd *tcmu_peek_cmd(struct tcmu_device *dev);
+uint32_t tcmu_get_cmd_tail(struct tcmu_device *dev);
+void tcmu_set_cmd_tail(struct tcmu_device *dev, uint32_t cmd_tail);
+char *tcmu_get_dev_name(struct tcmu_device *dev);
 
 /* Set/Get methods for interacting with configfs */
 char *tcmu_cfgfs_get_str(const char *path);
